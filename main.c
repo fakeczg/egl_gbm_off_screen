@@ -363,7 +363,7 @@ bool init_egl() {
         // 后面在修改代码；
         if (egl_init(EGL_PLATFORM_GBM_KHR, egl_fake.gbm_device)) {
             fake_log(DEBUG, "Using EGL_PLATFORM_GBM_KHR");
-            goto error;
+            return true;
         }
 
         gbm_device_destroy(egl_fake.gbm_device);
