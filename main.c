@@ -507,7 +507,80 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     return true;
 }
 
+bool check_basic_egl() {
+    const char *client_exts_str =
+        eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    if (client_exts_str == NULL) {
+        if (eglGetError() == EGL_BAD_DISPLAY) {
+            fake_log(ERROR, "EGL_EXT_client_extensions not supported");
+        } else {
+            fake_log(ERROR, "Failed to query EGL client extensions");
+        }
+        return false;
+    }
+
+    fake_log(INFO, "Supported EGL client extensions:\n %s", client_exts_str);
+
+    if (!check_egl_ext(client_exts_str, "EGL_EXT_platform_base")) {
+        fake_log(ERROR, " EGL_EXT_platform_base not supported");
+        return false;
+    }
+
+    load_egl_proc(&egl_fake.procs.eglGetPlatformDisplayEXT,
+                  "eglGetPlatformDisplayEXT");
+
+    egl_fake.exts.KHR_platform_gbm =
+        check_egl_ext(client_exts_str, "EGL_KHR_platform_gbm");
+
+    egl_fake.exts.EXT_platform_device =
+        check_egl_ext(client_exts_str, "EGL_EXT_platform_device");
+
+    if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
+        check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
+        load_egl_proc(&egl_fake.procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
+    }
+
+    if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
+        check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
+        egl_fake.exts.EXT_device_query = true;
+        load_egl_proc(&egl_fake.procs.eglQueryDeviceStringEXT,
+                      "eglQueryDeviceStringEXT");
+        load_egl_proc(&egl_fake.procs.eglQueryDisplayAttribEXT,
+                      "eglQueryDisplayAttribEXT");
+    }
+
+    if (check_egl_ext(client_exts_str, "EGL_KHR_debug")) {
+        load_egl_proc(&egl_fake.procs.eglDebugMessageControlKHR,
+                      "eglDebugMessageControlKHR");
+
+        static const EGLAttrib debug_attribs[] = {
+            EGL_DEBUG_MSG_CRITICAL_KHR,
+            EGL_TRUE,
+            EGL_DEBUG_MSG_ERROR_KHR,
+            EGL_TRUE,
+            EGL_DEBUG_MSG_WARN_KHR,
+            EGL_TRUE,
+            EGL_DEBUG_MSG_INFO_KHR,
+            EGL_TRUE,
+            EGL_NONE,
+        };
+        egl_fake.procs.eglDebugMessageControlKHR(egl_log, debug_attribs);
+    }
+
+    if (EGL_FALSE == eglBindAPI(EGL_OPENGL_ES_API)) {
+        fake_log(ERROR, "Failed to bind to the OpenGL ES API");
+        return false;
+    }
+
+    return true;
+}
+
 bool init_egl() {
+
+    // basic check egl
+    if (!check_basic_egl()) {
+        return false;
+    }
 
     // create egl device
     egl_fake.exts.EXT_platform_device = false;
@@ -591,74 +664,6 @@ bool init_gbm(const char *path) {
     return true;
 }
 
-bool check_egl() {
-    const char *client_exts_str =
-        eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-    if (client_exts_str == NULL) {
-        if (eglGetError() == EGL_BAD_DISPLAY) {
-            fake_log(ERROR, "EGL_EXT_client_extensions not supported");
-        } else {
-            fake_log(ERROR, "Failed to query EGL client extensions");
-        }
-        return false;
-    }
-
-    fake_log(INFO, "Supported EGL client extensions:\n %s", client_exts_str);
-
-    if (!check_egl_ext(client_exts_str, "EGL_EXT_platform_base")) {
-        fake_log(ERROR, " EGL_EXT_platform_base not supported");
-        return false;
-    }
-
-    load_egl_proc(&egl_fake.procs.eglGetPlatformDisplayEXT,
-                  "eglGetPlatformDisplayEXT");
-
-    egl_fake.exts.KHR_platform_gbm =
-        check_egl_ext(client_exts_str, "EGL_KHR_platform_gbm");
-
-    egl_fake.exts.EXT_platform_device =
-        check_egl_ext(client_exts_str, "EGL_EXT_platform_device");
-
-    if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
-        check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
-        load_egl_proc(&egl_fake.procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
-    }
-
-    if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
-        check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
-        egl_fake.exts.EXT_device_query = true;
-        load_egl_proc(&egl_fake.procs.eglQueryDeviceStringEXT,
-                      "eglQueryDeviceStringEXT");
-        load_egl_proc(&egl_fake.procs.eglQueryDisplayAttribEXT,
-                      "eglQueryDisplayAttribEXT");
-    }
-
-    if (check_egl_ext(client_exts_str, "EGL_KHR_debug")) {
-        load_egl_proc(&egl_fake.procs.eglDebugMessageControlKHR,
-                      "eglDebugMessageControlKHR");
-
-        static const EGLAttrib debug_attribs[] = {
-            EGL_DEBUG_MSG_CRITICAL_KHR,
-            EGL_TRUE,
-            EGL_DEBUG_MSG_ERROR_KHR,
-            EGL_TRUE,
-            EGL_DEBUG_MSG_WARN_KHR,
-            EGL_TRUE,
-            EGL_DEBUG_MSG_INFO_KHR,
-            EGL_TRUE,
-            EGL_NONE,
-        };
-        egl_fake.procs.eglDebugMessageControlKHR(egl_log, debug_attribs);
-    }
-
-    if (EGL_FALSE == eglBindAPI(EGL_OPENGL_ES_API)) {
-        fake_log(ERROR, "Failed to bind to the OpenGL ES API");
-        return false;
-    }
-
-    return true;
-}
-
 bool init_kms(const char *path) {
     egl_fake.card_fd = open(path, O_RDWR | O_CLOEXEC);
     assert(-1 != egl_fake.card_fd);
@@ -674,15 +679,11 @@ int main(int argc, char **argv) {
 
     init_kms("/dev/dri/card0");
 
-    if (!check_egl()) {
-        fake_log(ERROR, " The current device egl cannot meet the operating "
-                        "conditions of wlroots!!!");
-    }
-    fake_log(INFO, " The device can use egl init...");
-
     // init_gbm("/dev/dri/renderD128");
     // init_fake("/dev/dri/card0");
-    init_egl();
+    if (!init_egl())
+        fake_log(ERROR, "The current device egl cannot meet the operating "
+                        "conditions of wlroots!!!");
 
     fake_log(ERROR, "hello world!\r\n");
     return 0;
