@@ -3,6 +3,7 @@
 #include <EGL/eglext.h>
 #include <GL/gl.h>
 #include <assert.h>
+#include <drm_fourcc.h>
 #include <fcntl.h>
 #include <gbm.h>
 #include <stdbool.h>
@@ -12,6 +13,27 @@
 #include <string.h>
 #include <unistd.h>
 #include <xf86drm.h>
+
+/** A single DRM format, with a set of modifiers attached. */
+struct drm_format {
+    // The actual DRM format, from `drm_fourcc.h`
+    uint32_t format;
+    // The number of modifiers
+    size_t len;
+    // The capacity of the array; do not use.
+    size_t capacity;
+    // The actual modifiers
+    uint64_t modifiers[];
+};
+
+struct drm_format_set {
+    // The number of formats
+    size_t len;
+    // The capacity of the array; private to wlroots
+    size_t capacity;
+    // A pointer to an array of `struct wlr_drm_format *` of length `len`.
+    struct drm_format **formats;
+};
 
 struct egl {
     int card_fd;
@@ -24,6 +46,10 @@ struct egl {
 
     struct gbm_device *gbm_device;
     struct gbm_surface *gbm_surface;
+
+    bool has_modifiers;
+    struct drm_format_set dmabuf_texture_formats;
+    struct drm_format_set dmabuf_render_formats;
 
     struct {
         PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT;
@@ -77,11 +103,170 @@ static bool check_egl_ext(const char *exts, const char *ext);
 static void load_egl_proc(void *proc_ptr, const char *name);
 static bool device_has_name(const drmDevice *device, const char *name);
 static bool env_parse_bool(const char *option);
+static int get_egl_dmabuf_formats(struct egl *egl, int **formats);
+static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
+                                    uint64_t **modifiers,
+                                    EGLBoolean **external_only);
+static struct drm_format **format_set_get_ref(struct drm_format_set *set,
+                                              uint32_t format);
+
 // egl debug
 static enum log_importance egl_log_importance(EGLint type);
 static const char *egl_error_str(EGLint error);
 static void egl_log(EGLenum error, const char *command, EGLint msg_type,
                     EGLLabelKHR thread, EGLLabelKHR obj, const char *msg);
+
+struct drm_format *drm_format_create(uint32_t format) {
+    size_t capacity = 4;
+    struct drm_format *fmt =
+        calloc(1, sizeof(*fmt) + sizeof(fmt->modifiers[0]) * capacity);
+    if (!fmt) {
+        fake_log(ERROR, "Allocation failed");
+        return NULL;
+    }
+    fmt->format = format;
+    fmt->capacity = capacity;
+    return fmt;
+}
+
+bool drm_format_has(const struct drm_format *fmt, uint64_t modifier) {
+    for (size_t i = 0; i < fmt->len; ++i) {
+        if (fmt->modifiers[i] == modifier) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool drm_format_add(struct drm_format **fmt_ptr, uint64_t modifier) {
+    struct drm_format *fmt = *fmt_ptr;
+
+    if (drm_format_has(fmt, modifier)) {
+        return true;
+    }
+
+    if (fmt->len == fmt->capacity) {
+        size_t capacity = fmt->capacity ? fmt->capacity * 2 : 4;
+
+        fmt = realloc(fmt, sizeof(*fmt) + sizeof(fmt->modifiers[0]) * capacity);
+        if (!fmt) {
+            fake_log(ERROR, "Allocation failed");
+            return false;
+        }
+
+        fmt->capacity = capacity;
+        *fmt_ptr = fmt;
+    }
+
+    fmt->modifiers[fmt->len++] = modifier;
+    return true;
+}
+
+bool drm_format_set_add(struct drm_format_set *set, uint32_t format,
+                        uint64_t modifier) {
+    assert(format != DRM_FORMAT_INVALID);
+
+    struct drm_format **ptr = format_set_get_ref(set, format);
+    if (ptr) {
+        return drm_format_add(ptr, modifier);
+    }
+
+    struct drm_format *fmt = drm_format_create(format);
+    if (!fmt) {
+        return false;
+    }
+
+    if (!drm_format_add(&fmt, modifier)) {
+        return false;
+    }
+
+    if (set->len == set->capacity) {
+        size_t new = set->capacity ? set->capacity * 2 : 4;
+
+        struct drm_format **tmp = realloc(
+            set->formats, sizeof(*fmt) + sizeof(fmt->modifiers[0]) * new);
+        if (!tmp) {
+            fake_log(ERROR, "Allocation failed");
+            free(fmt);
+            return false;
+        }
+
+        set->capacity = new;
+        set->formats = tmp;
+    }
+
+    set->formats[set->len++] = fmt;
+    return true;
+}
+
+static void init_dmabuf_formats(struct egl *egl) {
+    int *formats;
+    int formats_len = get_egl_dmabuf_formats(egl, &formats);
+    if (formats_len < 0) {
+        return;
+    }
+    fake_log(ERROR, "egl support formats num = %d", formats_len);
+
+    bool has_modifiers = false;
+    for (int i = 0; i < formats_len; i++) {
+        uint32_t fmt = formats[i];
+
+        uint64_t *modifiers;
+        EGLBoolean *external_only;
+        int modifiers_len =
+            get_egl_dmabuf_modifiers(egl, fmt, &modifiers, &external_only);
+        if (modifiers_len < 0) {
+            continue;
+        }
+
+        has_modifiers = has_modifiers || modifiers_len > 0;
+
+        // EGL始终支持隐式修饰符
+        drm_format_set_add(&egl_fake.dmabuf_texture_formats, fmt,
+                           DRM_FORMAT_MOD_INVALID);
+        drm_format_set_add(&egl->dmabuf_render_formats, fmt,
+                           DRM_FORMAT_MOD_INVALID);
+
+        // 如果驱动程序没有明确说明，则假设支持线性布局
+        if (modifiers_len == 0) {
+            // Asume the linear layout is supported if the driver doesn't
+            // explicitly say otherwise
+            drm_format_set_add(&egl->dmabuf_texture_formats, fmt,
+                               DRM_FORMAT_MOD_LINEAR);
+            drm_format_set_add(&egl->dmabuf_render_formats, fmt,
+                               DRM_FORMAT_MOD_LINEAR);
+        }
+
+        for (int j = 0; j < modifiers_len; j++) {
+            drm_format_set_add(&egl->dmabuf_texture_formats, fmt, modifiers[j]);
+            if (!external_only[j]) {
+                drm_format_set_add(&egl->dmabuf_render_formats, fmt,
+                                   modifiers[j]);
+            }
+        }
+
+        free(modifiers);
+        free(external_only);
+    }
+
+    char *str_formats = malloc(formats_len * 5 + 1);
+    if (str_formats == NULL) {
+        goto out;
+    }
+    for (int i = 0; i < formats_len; i++) {
+        snprintf(&str_formats[i * 5], (formats_len - i) * 5 + 1, "%.4s ",
+                 (char *)&formats[i]);
+    }
+    fake_log(INFO, "Supported DMA-BUF formats: %s", str_formats);
+    fake_log(INFO, "EGL DMA-BUF format modifiers %s",
+             has_modifiers ? "supported" : "unsupported");
+    free(str_formats);
+
+    egl->has_modifiers = has_modifiers;
+
+out:
+    free(formats);
+}
 
 static int open_render_node(int drm_fd) {
     char *render_name = drmGetRenderDeviceNameFromFd(drm_fd);
@@ -265,7 +450,7 @@ static bool egl_init_display(EGLDisplay display) {
         fake_log(INFO, "EGL driver name: %s", driver_name);
     }
 
-    // 	init_dmabuf_formats(egl);
+    init_dmabuf_formats(&egl_fake);
 
     return true;
 }
@@ -615,4 +800,110 @@ static bool env_parse_bool(const char *option) {
 
     fake_log(ERROR, "Unknown %s option: %s", option, env);
     return false;
+}
+
+static int get_egl_dmabuf_formats(struct egl *egl, int **formats) {
+    if (!egl->exts.EXT_image_dma_buf_import) {
+        fake_log(DEBUG, "DMA-BUF import extension not present");
+        return -1;
+    }
+
+    // 当我们只有image_dmabuf_import扩展时，我们无法查询支持哪些格式。
+    // DRM_FORMAT_ARGB8888和DRM_FORMAT_XRGB8888这两个是一直被支持的,这是尝试创建缓冲区的预定方式。
+    // 当然只是一个猜测，但总比完全不支持dmabufs好，因为修改器扩展并不是到处都支持。
+    if (!egl->exts.EXT_image_dma_buf_import_modifiers) {
+        static const int fallback_formats[] = {
+            DRM_FORMAT_ARGB8888,
+            DRM_FORMAT_XRGB8888,
+        };
+        static unsigned num =
+            sizeof(fallback_formats) / sizeof(fallback_formats[0]);
+
+        *formats = calloc(num, sizeof(int));
+        if (!*formats) {
+            fake_log(ERROR, "Allocation failed");
+            return -1;
+        }
+
+        memcpy(*formats, fallback_formats, num * sizeof(**formats));
+        return num;
+    }
+
+    EGLint num;
+    if (!egl->procs.eglQueryDmaBufFormatsEXT(egl->display, 0, NULL, &num)) {
+        fake_log(ERROR, "Failed to query number of dmabuf formats");
+        return -1;
+    }
+
+    *formats = calloc(num, sizeof(int));
+    if (*formats == NULL) {
+        fake_log(ERROR, "Allocation failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (!egl->procs.eglQueryDmaBufFormatsEXT(egl->display, num, *formats,
+                                             &num)) {
+        fake_log(ERROR, "Failed to query dmabuf format");
+        free(*formats);
+        return -1;
+    }
+    return num;
+}
+
+static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
+                                    uint64_t **modifiers,
+                                    EGLBoolean **external_only) {
+    *modifiers = NULL;
+    *external_only = NULL;
+
+    if (!egl->exts.EXT_image_dma_buf_import) {
+        fake_log(DEBUG, "DMA-BUF extension not present");
+        return -1;
+    }
+    if (!egl->exts.EXT_image_dma_buf_import_modifiers) {
+        return 0;
+    }
+
+    EGLint num;
+    if (!egl->procs.eglQueryDmaBufModifiersEXT(egl->display, format, 0, NULL,
+                                               NULL, &num)) {
+        fake_log(ERROR, "Failed to query dmabuf number of modifiers");
+        return -1;
+    }
+    if (num == 0) {
+        return 0;
+    }
+
+    *modifiers = calloc(num, sizeof(uint64_t));
+    if (*modifiers == NULL) {
+        fake_log(ERROR, "Allocation failed");
+        return -1;
+    }
+    *external_only = calloc(num, sizeof(EGLBoolean));
+    if (*external_only == NULL) {
+        fake_log(ERROR, "Allocation failed");
+        free(*modifiers);
+        *modifiers = NULL;
+        return -1;
+    }
+
+    if (!egl->procs.eglQueryDmaBufModifiersEXT(
+            egl->display, format, num, *modifiers, *external_only, &num)) {
+        fake_log(ERROR, "Failed to query dmabuf modifiers");
+        free(*modifiers);
+        free(*external_only);
+        return -1;
+    }
+    return num;
+}
+
+static struct drm_format **format_set_get_ref(struct drm_format_set *set,
+                                              uint32_t format) {
+    for (size_t i = 0; i < set->len; ++i) {
+        if (set->formats[i]->format == format) {
+            return &set->formats[i];
+        }
+    }
+
+    return NULL;
 }
