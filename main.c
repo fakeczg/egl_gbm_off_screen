@@ -148,7 +148,7 @@ struct gles_renderer {
 };
 
 // struct
-struct egl egl_fake;
+struct egl egl_gbm;
 struct gles_renderer gles_fake;
 // function
 static bool check_gl_ext(const char *exts, const char *ext);
@@ -277,7 +277,7 @@ static void init_dmabuf_formats(struct egl *egl) {
         has_modifiers = has_modifiers || modifiers_len > 0;
 
         // EGL始终支持隐式修饰符
-        drm_format_set_add(&egl_fake.dmabuf_texture_formats, fmt,
+        drm_format_set_add(&egl_gbm.dmabuf_texture_formats, fmt,
                            DRM_FORMAT_MOD_INVALID);
         drm_format_set_add(&egl->dmabuf_render_formats, fmt,
                            DRM_FORMAT_MOD_INVALID);
@@ -349,14 +349,14 @@ static int open_render_node(int drm_fd) {
 }
 
 EGLDeviceEXT get_egl_device_from_fd(int fd) {
-    if (egl_fake.procs.eglQueryDevicesEXT == NULL) {
+    if (egl_gbm.procs.eglQueryDevicesEXT == NULL) {
         fake_log(DEBUG, "EGL_EXT_device_enumeration not supported");
         return EGL_NO_DEVICE_EXT;
     }
 
     EGLint nb_devices = 0;
     // NULL -> to get supported devices num in the system
-    if (!egl_fake.procs.eglQueryDevicesEXT(0, NULL, &nb_devices)) {
+    if (!egl_gbm.procs.eglQueryDevicesEXT(0, NULL, &nb_devices)) {
         fake_log(ERROR, "Failed to query EGL devices");
         return EGL_NO_DEVICE_EXT;
     }
@@ -369,7 +369,7 @@ EGLDeviceEXT get_egl_device_from_fd(int fd) {
         return EGL_NO_DEVICE_EXT;
     }
 
-    if (!egl_fake.procs.eglQueryDevicesEXT(nb_devices, devices, &nb_devices)) {
+    if (!egl_gbm.procs.eglQueryDevicesEXT(nb_devices, devices, &nb_devices)) {
         fake_log(ERROR, "Failed to query EGL devices");
         return EGL_NO_DEVICE_EXT;
     }
@@ -383,9 +383,9 @@ EGLDeviceEXT get_egl_device_from_fd(int fd) {
 
     EGLDeviceEXT egl_device = NULL;
     for (int i = 0; i < nb_devices; i++) {
-        const char *egl_device_name = egl_fake.procs.eglQueryDeviceStringEXT(
+        const char *egl_device_name = egl_gbm.procs.eglQueryDeviceStringEXT(
             devices[i], EGL_DRM_DEVICE_FILE_EXT);
-        /* const char *egl_device_name = egl_fake.procs.eglQueryDeviceStringEXT(
+        /* const char *egl_device_name = egl_gbm.procs.eglQueryDeviceStringEXT(
          */
         /* 		devices[i], EGL_DRM_RENDER_NODE_FILE_EXT); */
         if (egl_device_name == NULL) {
@@ -404,50 +404,50 @@ EGLDeviceEXT get_egl_device_from_fd(int fd) {
 }
 
 static bool egl_init_display(EGLDisplay display) {
-    egl_fake.display = display;
+    egl_gbm.display = display;
 
     EGLint major, minor;
-    if (eglInitialize(egl_fake.display, &major, &minor) == EGL_FALSE) {
+    if (eglInitialize(egl_gbm.display, &major, &minor) == EGL_FALSE) {
         fake_log(ERROR, "Failed to initialize EGL");
         return false;
     }
 
     const char *display_exts_str =
-        eglQueryString(egl_fake.display, EGL_EXTENSIONS);
+        eglQueryString(egl_gbm.display, EGL_EXTENSIONS);
     if (display_exts_str == NULL) {
         fake_log(ERROR, "Failed to query EGL display extensions");
         return false;
     }
 
     if (check_egl_ext(display_exts_str, "EGL_KHR_image_base")) {
-        egl_fake.exts.KHR_image_base = true;
-        load_egl_proc(&egl_fake.procs.eglCreateImageKHR, "eglCreateImageKHR");
-        load_egl_proc(&egl_fake.procs.eglDestroyImageKHR, "eglDestroyImageKHR");
+        egl_gbm.exts.KHR_image_base = true;
+        load_egl_proc(&egl_gbm.procs.eglCreateImageKHR, "eglCreateImageKHR");
+        load_egl_proc(&egl_gbm.procs.eglDestroyImageKHR, "eglDestroyImageKHR");
     }
 
-    egl_fake.exts.EXT_image_dma_buf_import =
+    egl_gbm.exts.EXT_image_dma_buf_import =
         check_egl_ext(display_exts_str, "EGL_EXT_image_dma_buf_import");
     if (check_egl_ext(display_exts_str,
                       "EGL_EXT_image_dma_buf_import_modifiers")) {
-        egl_fake.exts.EXT_image_dma_buf_import_modifiers = true;
-        load_egl_proc(&egl_fake.procs.eglQueryDmaBufFormatsEXT,
+        egl_gbm.exts.EXT_image_dma_buf_import_modifiers = true;
+        load_egl_proc(&egl_gbm.procs.eglQueryDmaBufFormatsEXT,
                       "eglQueryDmaBufFormatsEXT");
-        load_egl_proc(&egl_fake.procs.eglQueryDmaBufModifiersEXT,
+        load_egl_proc(&egl_gbm.procs.eglQueryDmaBufModifiersEXT,
                       "eglQueryDmaBufModifiersEXT");
     }
 
     const char *device_exts_str = NULL, *driver_name = NULL;
-    if (egl_fake.exts.EXT_device_query) {
+    if (egl_gbm.exts.EXT_device_query) {
         EGLAttrib device_attrib;
-        if (!egl_fake.procs.eglQueryDisplayAttribEXT(
-                egl_fake.display, EGL_DEVICE_EXT, &device_attrib)) {
+        if (!egl_gbm.procs.eglQueryDisplayAttribEXT(
+                egl_gbm.display, EGL_DEVICE_EXT, &device_attrib)) {
             fake_log(ERROR, "eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
             return false;
         }
-        egl_fake.device = (EGLDeviceEXT)device_attrib;
+        egl_gbm.device = (EGLDeviceEXT)device_attrib;
 
-        device_exts_str = egl_fake.procs.eglQueryDeviceStringEXT(
-            egl_fake.device, EGL_EXTENSIONS);
+        device_exts_str = egl_gbm.procs.eglQueryDeviceStringEXT(egl_gbm.device,
+                                                                EGL_EXTENSIONS);
         if (device_exts_str == NULL) {
             fake_log(ERROR, "eglQueryDeviceStringEXT(EGL_EXTENSIONS) failed");
             return false;
@@ -467,13 +467,13 @@ static bool egl_init_display(EGLDisplay display) {
 
 #ifdef EGL_DRIVER_NAME_EXT
         if (check_egl_ext(device_exts_str, "EGL_EXT_device_persistent_id")) {
-            driver_name = egl_fake.procs.eglQueryDeviceStringEXT(
-                egl_fake.device, EGL_DRIVER_NAME_EXT);
+            driver_name = egl_gbm.procs.eglQueryDeviceStringEXT(
+                egl_gbm.device, EGL_DRIVER_NAME_EXT);
         }
 #endif
-        egl_fake.exts.EXT_device_drm =
+        egl_gbm.exts.EXT_device_drm =
             check_egl_ext(device_exts_str, "EGL_EXT_device_drm");
-        egl_fake.exts.EXT_device_drm_render_node =
+        egl_gbm.exts.EXT_device_drm_render_node =
             check_egl_ext(device_exts_str, "EGL_EXT_device_drm_render_node");
     }
 
@@ -489,7 +489,7 @@ static bool egl_init_display(EGLDisplay display) {
         return false;
     }
 
-    egl_fake.exts.IMG_context_priority =
+    egl_gbm.exts.IMG_context_priority =
         check_egl_ext(display_exts_str, "EGL_IMG_context_priority");
 
     fake_log(INFO, "Using EGL %d.%d", (int)major, (int)minor);
@@ -498,19 +498,19 @@ static bool egl_init_display(EGLDisplay display) {
         fake_log(INFO, "Supported EGL device extensions: %s", device_exts_str);
     }
     fake_log(INFO, "EGL vendor: %s",
-             eglQueryString(egl_fake.display, EGL_VENDOR));
+             eglQueryString(egl_gbm.display, EGL_VENDOR));
     if (driver_name != NULL) {
         fake_log(INFO, "EGL driver name: %s", driver_name);
     }
 
-    init_dmabuf_formats(&egl_fake);
+    init_dmabuf_formats(&egl_gbm);
 
     return true;
 }
 
 static bool egl_init(EGLenum platform, void *remote_display) {
     EGLDisplay display =
-        egl_fake.procs.eglGetPlatformDisplayEXT(platform, remote_display, NULL);
+        egl_gbm.procs.eglGetPlatformDisplayEXT(platform, remote_display, NULL);
     if (display == EGL_NO_DISPLAY) {
         fake_log(ERROR, "Failed to create EGL display");
         return false;
@@ -527,7 +527,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
 
     // Request a high priority context if possible
     // TODO: only do this if we're running as the DRM master
-    bool request_high_priority = egl_fake.exts.IMG_context_priority;
+    bool request_high_priority = egl_gbm.exts.IMG_context_priority;
 
     // Try to reschedule all of our rendering to be completed first. If it
     // fails, it will fallback to the default priority (MEDIUM).
@@ -539,16 +539,16 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     attribs[atti++] = EGL_NONE;
     assert(atti <= sizeof(attribs) / sizeof(attribs[0]));
 
-    egl_fake.context = eglCreateContext(egl_fake.display, EGL_NO_CONFIG_KHR,
-                                        EGL_NO_CONTEXT, attribs);
-    if (egl_fake.context == EGL_NO_CONTEXT) {
+    egl_gbm.context = eglCreateContext(egl_gbm.display, EGL_NO_CONFIG_KHR,
+                                       EGL_NO_CONTEXT, attribs);
+    if (egl_gbm.context == EGL_NO_CONTEXT) {
         fake_log(ERROR, "Failed to create EGL context");
         return false;
     }
 
     if (request_high_priority) {
         EGLint priority = EGL_CONTEXT_PRIORITY_MEDIUM_IMG;
-        eglQueryContext(egl_fake.display, egl_fake.context,
+        eglQueryContext(egl_gbm.display, egl_gbm.context,
                         EGL_CONTEXT_PRIORITY_LEVEL_IMG, &priority);
         if (priority != EGL_CONTEXT_PRIORITY_HIGH_IMG) {
             fake_log(INFO, "Failed to obtain a high priority context");
@@ -579,31 +579,31 @@ bool check_basic_egl() {
         return false;
     }
 
-    load_egl_proc(&egl_fake.procs.eglGetPlatformDisplayEXT,
+    load_egl_proc(&egl_gbm.procs.eglGetPlatformDisplayEXT,
                   "eglGetPlatformDisplayEXT");
 
-    egl_fake.exts.KHR_platform_gbm =
+    egl_gbm.exts.KHR_platform_gbm =
         check_egl_ext(client_exts_str, "EGL_KHR_platform_gbm");
 
-    egl_fake.exts.EXT_platform_device =
+    egl_gbm.exts.EXT_platform_device =
         check_egl_ext(client_exts_str, "EGL_EXT_platform_device");
 
     if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
         check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
-        load_egl_proc(&egl_fake.procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
+        load_egl_proc(&egl_gbm.procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
     }
 
     if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
         check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
-        egl_fake.exts.EXT_device_query = true;
-        load_egl_proc(&egl_fake.procs.eglQueryDeviceStringEXT,
+        egl_gbm.exts.EXT_device_query = true;
+        load_egl_proc(&egl_gbm.procs.eglQueryDeviceStringEXT,
                       "eglQueryDeviceStringEXT");
-        load_egl_proc(&egl_fake.procs.eglQueryDisplayAttribEXT,
+        load_egl_proc(&egl_gbm.procs.eglQueryDisplayAttribEXT,
                       "eglQueryDisplayAttribEXT");
     }
 
     if (check_egl_ext(client_exts_str, "EGL_KHR_debug")) {
-        load_egl_proc(&egl_fake.procs.eglDebugMessageControlKHR,
+        load_egl_proc(&egl_gbm.procs.eglDebugMessageControlKHR,
                       "eglDebugMessageControlKHR");
 
         static const EGLAttrib debug_attribs[] = {
@@ -617,7 +617,7 @@ bool check_basic_egl() {
             EGL_TRUE,
             EGL_NONE,
         };
-        egl_fake.procs.eglDebugMessageControlKHR(egl_log, debug_attribs);
+        egl_gbm.procs.eglDebugMessageControlKHR(egl_log, debug_attribs);
     }
 
     if (EGL_FALSE == eglBindAPI(EGL_OPENGL_ES_API)) {
@@ -636,13 +636,13 @@ bool init_egl() {
     }
 
     // create egl device
-    egl_fake.exts.EXT_platform_device = false;
-    if (egl_fake.exts.EXT_platform_device) {
+    egl_gbm.exts.EXT_platform_device = false;
+    if (egl_gbm.exts.EXT_platform_device) {
         /*
          * Search for the EGL device matching the DRM fd using the
          * EXT_device_enumeration extension.
          */
-        EGLDeviceEXT egl_device = get_egl_device_from_fd(egl_fake.card_fd);
+        EGLDeviceEXT egl_device = get_egl_device_from_fd(egl_gbm.card_fd);
         if (egl_device != EGL_NO_DEVICE_EXT) {
             if (egl_init(EGL_PLATFORM_DEVICE_EXT, egl_device)) {
                 fake_log(DEBUG, "Using EGL_PLATFORM_DEVICE_EXT");
@@ -655,15 +655,15 @@ bool init_egl() {
         fake_log(DEBUG, "EXT_platform_device not supported");
     }
 
-    if (egl_fake.exts.KHR_platform_gbm) {
-        int gbm_fd = open_render_node(egl_fake.card_fd);
+    if (egl_gbm.exts.KHR_platform_gbm) {
+        int gbm_fd = open_render_node(egl_gbm.card_fd);
         if (gbm_fd < 0) {
             fake_log(ERROR, "Failed to open DRM render node");
             goto error;
         }
 
-        egl_fake.gbm_device = gbm_create_device(gbm_fd);
-        if (!egl_fake.gbm_device) {
+        egl_gbm.gbm_device = gbm_create_device(gbm_fd);
+        if (!egl_gbm.gbm_device) {
             close(gbm_fd);
             fake_log(ERROR, "Failed to create GBM device");
             goto error;
@@ -672,12 +672,12 @@ bool init_egl() {
         // 这里注意，后面需要有一些显卡需要用card节点创建
         // 比如Mali-G76是要用car0来创建gbm_device，才能拿到EGL display的
         // 后面在修改代码；
-        if (egl_init(EGL_PLATFORM_GBM_KHR, egl_fake.gbm_device)) {
+        if (egl_init(EGL_PLATFORM_GBM_KHR, egl_gbm.gbm_device)) {
             fake_log(DEBUG, "Using EGL_PLATFORM_GBM_KHR");
             return true;
         }
 
-        gbm_device_destroy(egl_fake.gbm_device);
+        gbm_device_destroy(egl_gbm.gbm_device);
         close(gbm_fd);
     } else {
         fake_log(DEBUG, "KHR_platform_gbm not supported");
@@ -685,10 +685,10 @@ bool init_egl() {
 
 error:
     fake_log(ERROR, "Failed to initialize EGL context");
-    if (egl_fake.display) {
-        eglMakeCurrent(egl_fake.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+    if (egl_gbm.display) {
+        eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                        EGL_NO_CONTEXT);
-        eglTerminate(egl_fake.display);
+        eglTerminate(egl_gbm.display);
     }
     eglReleaseThread();
 
@@ -697,16 +697,16 @@ error:
 
 bool init_gbm(const char *path) {
 
-    egl_fake.render_fd = open(path, O_RDWR | O_CLOEXEC);
-    assert(0 != egl_fake.render_fd);
+    egl_gbm.render_fd = open(path, O_RDWR | O_CLOEXEC);
+    assert(0 != egl_gbm.render_fd);
 
-    egl_fake.gbm_device = gbm_create_device(egl_fake.render_fd);
-    assert(0 != egl_fake.gbm_device);
+    egl_gbm.gbm_device = gbm_create_device(egl_gbm.render_fd);
+    assert(0 != egl_gbm.gbm_device);
 
     // https://mlog.club/article/1818788
     // https://cgit.freedesktop.org/mesa/mesa/commit/src/egl/main?id=468cc866b4b308cee40470f06b31002c6c56da96
     // 1. + 2. = 3. + 4.eglGetPlatformDisplay
-    /* 1. eglGetDisplay((EGLNativeDisplayType)egl_fake.gbm_device);  */
+    /* 1. eglGetDisplay((EGLNativeDisplayType)egl_gbm.gbm_device);  */
     /* 2. eglCreateWindowSurface(egl_dpy, egl_config,
      * EGLNativeWindowType)my_fake_surface, NULL); */
     /* 3. eglGetPlatformDisplayEXT(EGL_PLATFORM_fake_MESA, my_fake_device,
@@ -718,8 +718,8 @@ bool init_gbm(const char *path) {
 }
 
 bool init_kms(const char *path) {
-    egl_fake.card_fd = open(path, O_RDWR | O_CLOEXEC);
-    assert(-1 != egl_fake.card_fd);
+    egl_gbm.card_fd = open(path, O_RDWR | O_CLOEXEC);
+    assert(-1 != egl_gbm.card_fd);
 
     return true;
 }
@@ -809,7 +809,7 @@ int main(int argc, char **argv) {
         fake_log(ERROR, "The current device egl cannot meet the operating "
                         "conditions of wlroots!!!");
 
-    if (!init_opengles(&egl_fake))
+    if (!init_opengles(&egl_gbm))
         fake_log(ERROR, "The current device opengles cannot meet the operating "
                         "conditions of wlroots!!!");
 
