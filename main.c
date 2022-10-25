@@ -1,7 +1,8 @@
 #include "log.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GL/gl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <fcntl.h>
@@ -33,6 +34,15 @@ struct drm_format_set {
     size_t capacity;
     // A pointer to an array of `struct wlr_drm_format *` of length `len`.
     struct drm_format **formats;
+};
+
+struct gles2_tex_shader {
+    GLuint program;
+    GLint proj;
+    GLint tex;
+    GLint alpha;
+    GLint pos_attrib;
+    GLint tex_attrib;
 };
 
 struct egl {
@@ -96,9 +106,54 @@ struct egl {
     uint32_t m_frame_cnt;
     int m_data[4];
 };
+
+struct gles_renderer {
+    float projection[9];
+    struct egl *egl;
+    int drm_fd;
+
+    const char *exts_str;
+    struct {
+        bool EXT_read_format_bgra;
+        bool KHR_debug;
+        bool OES_egl_image_external;
+        bool OES_egl_image;
+        bool EXT_texture_type_2_10_10_10_REV;
+        bool OES_texture_half_float_linear;
+        bool EXT_texture_norm16;
+    } exts;
+
+    struct {
+        PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+        PFNGLDEBUGMESSAGECALLBACKKHRPROC glDebugMessageCallbackKHR;
+        PFNGLDEBUGMESSAGECONTROLKHRPROC glDebugMessageControlKHR;
+        PFNGLPOPDEBUGGROUPKHRPROC glPopDebugGroupKHR;
+        PFNGLPUSHDEBUGGROUPKHRPROC glPushDebugGroupKHR;
+        PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC
+        glEGLImageTargetRenderbufferStorageOES;
+    } procs;
+
+    struct {
+        struct {
+            GLuint program;
+            GLint proj;
+            GLint color;
+            GLint pos_attrib;
+        } quad;
+        struct gles2_tex_shader tex_rgba;
+        struct gles2_tex_shader tex_rgbx;
+        struct gles2_tex_shader tex_ext;
+    } shaders;
+    uint32_t viewport_width, viewport_height;
+};
+
 // struct
 struct egl egl_fake;
+struct gles_renderer gles_fake;
 // function
+static bool check_gl_ext(const char *exts, const char *ext);
+static void load_gl_proc(void *proc_ptr, const char *name);
+bool egl_make_current(struct egl *egl);
 static bool check_egl_ext(const char *exts, const char *ext);
 static void load_egl_proc(void *proc_ptr, const char *name);
 static bool device_has_name(const drmDevice *device, const char *name);
@@ -356,8 +411,6 @@ static bool egl_init_display(EGLDisplay display) {
         fake_log(ERROR, "Failed to initialize EGL");
         return false;
     }
-
-    fake_log(INFO, "Use Display Egl: major %d minor %d", major, minor);
 
     const char *display_exts_str =
         eglQueryString(egl_fake.display, EGL_EXTENSIONS);
@@ -671,6 +724,77 @@ bool init_kms(const char *path) {
     return true;
 }
 
+bool init_opengles(struct egl *egl) {
+    if (!egl_make_current(egl)) {
+        goto error;
+    }
+
+    const char *exts_str = (const char *)glGetString(GL_EXTENSIONS);
+    if (exts_str == NULL) {
+        fake_log(ERROR, "Failed to get GL_EXTENSIONS");
+        goto error;
+    }
+    gles_fake.egl = egl;
+    gles_fake.exts_str = exts_str;
+    gles_fake.drm_fd = -1;
+
+    if (!gles_fake.egl->exts.EXT_image_dma_buf_import) {
+        fake_log(ERROR, "EGL_EXT_image_dma_buf_import not supported");
+        goto error;
+    }
+
+    if (!check_gl_ext(exts_str, "GL_EXT_texture_format_BGRA8888")) {
+        fake_log(ERROR, "BGRA8888 format not supported by GLES2");
+        goto error;
+    }
+    if (!check_gl_ext(exts_str, "GL_EXT_unpack_subimage")) {
+        fake_log(ERROR, "GL_EXT_unpack_subimage not supported");
+        goto error;
+    }
+
+    gles_fake.exts.EXT_read_format_bgra =
+        check_gl_ext(exts_str, "GL_EXT_read_format_bgra");
+
+    gles_fake.exts.EXT_texture_type_2_10_10_10_REV =
+        check_gl_ext(exts_str, "GL_EXT_texture_type_2_10_10_10_REV");
+
+    gles_fake.exts.OES_texture_half_float_linear =
+        check_gl_ext(exts_str, "GL_OES_texture_half_float_linear");
+
+    gles_fake.exts.EXT_texture_norm16 =
+        check_gl_ext(exts_str, "GL_EXT_texture_norm16");
+
+    if (check_gl_ext(exts_str, "GL_KHR_debug")) {
+        gles_fake.exts.KHR_debug = true;
+        load_gl_proc(&gles_fake.procs.glDebugMessageCallbackKHR,
+                     "glDebugMessageCallbackKHR");
+        load_gl_proc(&gles_fake.procs.glDebugMessageControlKHR,
+                     "glDebugMessageControlKHR");
+    }
+
+    if (check_gl_ext(exts_str, "GL_OES_EGL_image_external")) {
+        gles_fake.exts.OES_egl_image_external = true;
+        load_gl_proc(&gles_fake.procs.glEGLImageTargetTexture2DOES,
+                     "glEGLImageTargetTexture2DOES");
+    }
+
+    if (check_gl_ext(exts_str, "GL_OES_EGL_image")) {
+        gles_fake.exts.OES_egl_image = true;
+        load_gl_proc(&gles_fake.procs.glEGLImageTargetRenderbufferStorageOES,
+                     "glEGLImageTargetRenderbufferStorageOES");
+    }
+
+    fake_log(INFO, "Using %s", glGetString(GL_VERSION));
+    fake_log(INFO, "GL vendor: %s", glGetString(GL_VENDOR));
+    fake_log(INFO, "GL renderer: %s", glGetString(GL_RENDERER));
+    fake_log(INFO, "Supported GLES2 extensions: %s", exts_str);
+
+    return true;
+
+error:
+    return false;
+}
+
 int main(int argc, char **argv) {
 
     log_init(DEBUG, NULL);
@@ -685,8 +809,48 @@ int main(int argc, char **argv) {
         fake_log(ERROR, "The current device egl cannot meet the operating "
                         "conditions of wlroots!!!");
 
+    if (!init_opengles(&egl_fake))
+        fake_log(ERROR, "The current device opengles cannot meet the operating "
+                        "conditions of wlroots!!!");
+
     fake_log(ERROR, "hello world!\r\n");
     return 0;
+}
+
+bool egl_make_current(struct egl *egl) {
+    if (!eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        egl->context)) {
+        fake_log(ERROR, "eglMakeCurrent failed");
+        return false;
+    }
+    return true;
+}
+
+static bool check_gl_ext(const char *exts, const char *ext) {
+    size_t extlen = strlen(ext);
+    const char *end = exts + strlen(exts);
+
+    while (exts < end) {
+        if (exts[0] == ' ') {
+            exts++;
+            continue;
+        }
+        size_t n = strcspn(exts, " ");
+        if (n == extlen && strncmp(ext, exts, n) == 0) {
+            return true;
+        }
+        exts += n;
+    }
+    return false;
+}
+
+static void load_gl_proc(void *proc_ptr, const char *name) {
+    void *proc = (void *)eglGetProcAddress(name);
+    if (proc == NULL) {
+        fake_log(ERROR, "glGetProcAddress(%s) failed", name);
+        abort();
+    }
+    *(void **)proc_ptr = proc;
 }
 
 static bool check_egl_ext(const char *exts, const char *ext) {
