@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 
 /** A single DRM format, with a set of modifiers attached. */
 struct drm_format {
@@ -56,6 +57,13 @@ struct egl {
 
     struct gbm_device *gbm_device;
     struct gbm_surface *gbm_surface;
+
+    int connector_id;
+    drmModeResPtr resources;
+    drmModeConnectorPtr connector;
+    drmModeModeInfo mode;
+    drmModeEncoderPtr encoder;
+    drmModeCrtcPtr crtc;
 
     bool has_modifiers;
     struct drm_format_set dmabuf_texture_formats;
@@ -508,6 +516,20 @@ static bool egl_init_display(EGLDisplay display) {
     return true;
 }
 
+static int match_config_to_visual(EGLDisplay egl_display, EGLint visual_id,
+                                  EGLConfig *configs, int count) {
+
+    EGLint id;
+    for (int i = 0; i < count; ++i) {
+        if (!eglGetConfigAttrib(egl_display, configs[i], EGL_NATIVE_VISUAL_ID,
+                                &id))
+            continue;
+        if (id == visual_id)
+            return i;
+    }
+    return -1;
+}
+
 static bool egl_init(EGLenum platform, void *remote_display) {
     EGLDisplay display =
         egl_gbm.procs.eglGetPlatformDisplayEXT(platform, remote_display, NULL);
@@ -519,6 +541,36 @@ static bool egl_init(EGLenum platform, void *remote_display) {
         eglTerminate(display);
         return false;
     }
+        // use surface specify config
+    const EGLint config_attribs[] = {
+        EGL_BUFFER_SIZE,     32,
+        EGL_DEPTH_SIZE,      EGL_DONT_CARE,
+        EGL_STENCIL_SIZE,    EGL_DONT_CARE,
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,        8,
+        EGL_GREEN_SIZE,      8,
+        EGL_BLUE_SIZE,       8,
+        EGL_ALPHA_SIZE,      8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE,
+    };
+    EGLint max_num_configs, num_configs, config_index;
+    if (!eglGetConfigs(display, NULL, 0, &max_num_configs)) {
+        fake_log(ERROR, "Failed to get display configs");
+        return false;
+    }
+    fake_log(INFO, "Display config max num = %d", max_num_configs);
+    EGLConfig *configs = malloc(num_configs * sizeof(EGLConfig));
+    if (!eglChooseConfig(display, config_attribs, configs, max_num_configs,
+                         &num_configs)) {
+        fake_log(ERROR, "Failed to choose specify configs");
+        return false;
+    }
+    fake_log(INFO, "匹配 config_attribs Display choose config num = %d",
+             num_configs);
+    config_index = match_config_to_visual(display, GBM_FORMAT_ARGB8888, configs,
+                                          num_configs);
+    fake_log(INFO, "index = %d", config_index);
 
     size_t atti = 0;
     EGLint attribs[5];
@@ -538,6 +590,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
 
     attribs[atti++] = EGL_NONE;
     assert(atti <= sizeof(attribs) / sizeof(attribs[0]));
+
 
     egl_gbm.context = eglCreateContext(egl_gbm.display, EGL_NO_CONFIG_KHR,
                                        EGL_NO_CONTEXT, attribs);
@@ -669,6 +722,17 @@ bool init_egl() {
             goto error;
         }
 
+        // use gbm surface to gen window surface
+        egl_gbm.gbm_surface = gbm_surface_create(
+            egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+        if (!egl_gbm.gbm_surface) {
+            gbm_device_destroy(egl_gbm.gbm_device);
+            close(gbm_fd);
+            fake_log(ERROR, "Failed to create GBM Surface");
+            goto error;
+        }
+
         // 这里注意，后面需要有一些显卡需要用card节点创建
         // 比如Mali-G76是要用car0来创建gbm_device，才能拿到EGL display的
         // 后面在修改代码；
@@ -677,6 +741,7 @@ bool init_egl() {
             return true;
         }
 
+        gbm_surface_destroy(egl_gbm.gbm_surface);
         gbm_device_destroy(egl_gbm.gbm_device);
         close(gbm_fd);
     } else {
@@ -698,28 +763,72 @@ error:
 bool init_gbm(const char *path) {
 
     egl_gbm.render_fd = open(path, O_RDWR | O_CLOEXEC);
-    assert(0 != egl_gbm.render_fd);
+    assert(-1 != egl_gbm.render_fd);
 
     egl_gbm.gbm_device = gbm_create_device(egl_gbm.render_fd);
-    assert(0 != egl_gbm.gbm_device);
+    assert(NULL != egl_gbm.gbm_device);
 
     // https://mlog.club/article/1818788
     // https://cgit.freedesktop.org/mesa/mesa/commit/src/egl/main?id=468cc866b4b308cee40470f06b31002c6c56da96
-    // 1. + 2. = 3. + 4.eglGetPlatformDisplay
-    /* 1. eglGetDisplay((EGLNativeDisplayType)egl_gbm.gbm_device);  */
-    /* 2. eglCreateWindowSurface(egl_dpy, egl_config,
-     * EGLNativeWindowType)my_fake_surface, NULL); */
-    /* 3. eglGetPlatformDisplayEXT(EGL_PLATFORM_fake_MESA, my_fake_device,
-     * NULL); */
-    /* 4. eglCreatePlatformWindowSurfaceEXT(egl_dpy, egl_config,
-     * my_fake_surface, NULL); */
+    // use surface to manage buffer
+    egl_gbm.gbm_surface = gbm_surface_create(
+        egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+        GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    assert(NULL != egl_gbm.gbm_surface);
 
     return true;
+}
+
+static drmModeConnector *find_connector(int fd, drmModeRes *resources) {
+
+    for (int i = 0; i < resources->count_connectors; i++) {
+        drmModeConnector *connector =
+            drmModeGetConnector(fd, resources->connectors[i]);
+        if (connector->connection == DRM_MODE_CONNECTED) {
+            return connector;
+        }
+        drmModeFreeConnector(connector);
+    }
+    return NULL; // if no connector found
+}
+
+static drmModeEncoder *find_encoder(int fd, drmModeRes *resources,
+                                    drmModeConnector *connector) {
+
+    if (connector->encoder_id) {
+        return drmModeGetEncoder(fd, connector->encoder_id);
+    }
+    return NULL; // if no encoder found
 }
 
 bool init_kms(const char *path) {
     egl_gbm.card_fd = open(path, O_RDWR | O_CLOEXEC);
     assert(-1 != egl_gbm.card_fd);
+
+    egl_gbm.resources = drmModeGetResources(egl_gbm.card_fd);
+    assert(NULL != egl_gbm.resources);
+
+    egl_gbm.connector = find_connector(egl_gbm.card_fd, egl_gbm.resources);
+    assert(NULL != egl_gbm.connector);
+
+    fake_log(INFO, "Modes list:");
+    for (int i = 0; i < egl_gbm.connector->count_modes; i++) {
+        fake_log(INFO, "    Mode %d: %s", i, egl_gbm.connector->modes[i].name);
+    }
+
+    egl_gbm.connector_id = egl_gbm.connector->connector_id;
+    egl_gbm.mode = egl_gbm.connector->modes[0];
+
+    egl_gbm.encoder =
+        find_encoder(egl_gbm.card_fd, egl_gbm.resources, egl_gbm.connector);
+    assert(NULL != egl_gbm.encoder);
+
+    egl_gbm.crtc = drmModeGetCrtc(egl_gbm.card_fd, egl_gbm.encoder->crtc_id);
+    assert(NULL != egl_gbm.crtc);
+
+    drmModeFreeEncoder(egl_gbm.encoder);
+    drmModeFreeConnector(egl_gbm.connector);
+    drmModeFreeResources(egl_gbm.resources);
 
     return true;
 }
@@ -803,8 +912,9 @@ int main(int argc, char **argv) {
 
     init_kms("/dev/dri/card0");
 
+    // gbm init move to init_egl
     // init_gbm("/dev/dri/renderD128");
-    // init_fake("/dev/dri/card0");
+
     if (!init_egl())
         fake_log(ERROR, "The current device egl cannot meet the operating "
                         "conditions of wlroots!!!");
