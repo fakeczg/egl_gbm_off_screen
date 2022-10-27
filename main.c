@@ -52,13 +52,18 @@ struct egl {
 
     EGLDisplay display;
     EGLContext context;
-    EGLSurface surface;
+    EGLSurface window_surface;
     EGLDeviceEXT device; // may be EGL_NO_DEVICE_EXT
 
     struct gbm_device *gbm_device;
     struct gbm_surface *gbm_surface;
+    struct gbm_bo *gbm_bo;
+    unsigned int handle;
+    unsigned int pitch;
+    unsigned int fb_id;
+    uint64_t modifier;
 
-    int connector_id;
+    unsigned int connector_id;
     drmModeResPtr resources;
     drmModeConnectorPtr connector;
     drmModeModeInfo mode;
@@ -71,7 +76,8 @@ struct egl {
 
     struct {
         PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT;
-        PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC eglCreatePlatformWindowSurfaceEXT;
+        PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC
+            eglCreatePlatformWindowSurfaceEXT;
         PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
         PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
         PFNEGLQUERYWAYLANDBUFFERWL eglQueryWaylandBufferWL;
@@ -542,20 +548,20 @@ static bool egl_init(EGLenum platform, void *remote_display) {
         eglTerminate(display);
         return false;
     }
-        // use surface specify config
+    // use surface specify config
     const EGLint attribList[] = {
         EGL_RENDER_BUFFER, EGL_BACK_BUFFER,
         EGL_NONE,
     };
     const EGLint config_attribs[] = {
-        EGL_BUFFER_SIZE,     32,
-        EGL_DEPTH_SIZE,      EGL_DONT_CARE,
-        EGL_STENCIL_SIZE,    EGL_DONT_CARE,
-        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-        EGL_RED_SIZE,        8,
-        EGL_GREEN_SIZE,      8,
-        EGL_BLUE_SIZE,       8,
-        EGL_ALPHA_SIZE,      8,
+        EGL_BUFFER_SIZE, 32, // color component bit 32
+        EGL_DEPTH_SIZE, EGL_DONT_CARE,
+        EGL_STENCIL_SIZE, EGL_DONT_CARE,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_NONE,
     };
@@ -576,10 +582,16 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     config_index = match_config_to_visual(display, GBM_FORMAT_ARGB8888, configs,
                                           num_configs);
     fake_log(INFO, "index = %d", config_index);
-	//1. egl_gbm.surface = eglCreateWindowSurface(egl_gbm.display, configs[config_index], (EGLNativeWindowType)egl_gbm.gbm_surface, attribList);
-	//2. egl_gbm.surface = eglCreatePlatformWindowSurface(egl_gbm.display, configs[config_index], egl_gbm.gbm_surface, (EGLAttrib *)attribList);
-	egl_gbm.surface = egl_gbm.procs.eglCreatePlatformWindowSurfaceEXT(egl_gbm.display, configs[config_index], egl_gbm.gbm_surface, attribList);
-    if (egl_gbm.surface == EGL_NO_SURFACE) {
+    // 1. egl_gbm.window_surface = eglCreateWindowSurface(egl_gbm.display,
+    // configs[config_index], (EGLNativeWindowType)egl_gbm.gbm_surface,
+    // attribList);
+    // 2. egl_gbm.window_surface =
+    // eglCreatePlatformWindowSurface(egl_gbm.display, configs[config_index],
+    // egl_gbm.gbm_surface, (EGLAttrib *)attribList);
+    egl_gbm.window_surface = egl_gbm.procs.eglCreatePlatformWindowSurfaceEXT(
+        egl_gbm.display, configs[config_index], egl_gbm.gbm_surface,
+        attribList);
+    if (egl_gbm.window_surface == EGL_NO_SURFACE) {
         fake_log(ERROR, "Failed to create EGL Surface");
         return false;
     }
@@ -603,7 +615,6 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     attribs[atti++] = EGL_NONE;
     assert(atti <= sizeof(attribs) / sizeof(attribs[0]));
 
-
     egl_gbm.context = eglCreateContext(egl_gbm.display, configs[config_index],
                                        EGL_NO_CONTEXT, attribs);
     if (egl_gbm.context == EGL_NO_CONTEXT) {
@@ -621,7 +632,6 @@ static bool egl_init(EGLenum platform, void *remote_display) {
             fake_log(DEBUG, "Obtained high priority context");
         }
     }
-
 
     return true;
 }
@@ -725,7 +735,8 @@ bool init_egl() {
     }
 
     if (egl_gbm.exts.KHR_platform_gbm) {
-        int gbm_fd = open_render_node(egl_gbm.card_fd);
+		// we use egl swapbuffer to set crtc muse card fd
+        int gbm_fd = egl_gbm.card_fd;//open_render_node(egl_gbm.card_fd);
         if (gbm_fd < 0) {
             fake_log(ERROR, "Failed to open DRM render node");
             goto error;
@@ -741,7 +752,7 @@ bool init_egl() {
         // use gbm surface to gen window surface
         egl_gbm.gbm_surface = gbm_surface_create(
             egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
-            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT |  GBM_BO_USE_RENDERING);
         if (!egl_gbm.gbm_surface) {
             gbm_device_destroy(egl_gbm.gbm_device);
             close(gbm_fd);
@@ -920,6 +931,24 @@ error:
     return false;
 }
 
+static void draw_color_use_window_surface() {
+    eglMakeCurrent(egl_gbm.display, egl_gbm.window_surface,
+                   egl_gbm.window_surface, egl_gbm.context);
+    glClearColor(1.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    eglSwapBuffers(egl_gbm.display, egl_gbm.window_surface);
+    egl_gbm.gbm_bo = gbm_surface_lock_front_buffer(egl_gbm.gbm_surface);
+    egl_gbm.handle = gbm_bo_get_handle(egl_gbm.gbm_bo).u32;
+    egl_gbm.pitch =
+        gbm_bo_get_stride(egl_gbm.gbm_bo); // pitch = mode.hdisplay * 4
+    // fake_log(ERROR, "handle = %d pitch = %d", egl_gbm.handle, egl_gbm.pitch);
+    ret = drmModeAddFB(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+                 24, 32, egl_gbm.pitch, egl_gbm.handle, &egl_gbm.fb_id);
+    ret = drmModeSetCrtc(egl_gbm.card_fd, egl_gbm.crtc->crtc_id, egl_gbm.fb_id, 0, 0,
+                   &egl_gbm.connector_id, 1, &egl_gbm.mode);
+    getchar();
+}
+
 int main(int argc, char **argv) {
 
     log_init(DEBUG, NULL);
@@ -939,7 +968,9 @@ int main(int argc, char **argv) {
         fake_log(ERROR, "The current device opengles cannot meet the operating "
                         "conditions of wlroots!!!");
 
-    fake_log(ERROR, "hello world!\r\n");
+    fake_log(ERROR, "hello world!");
+    fake_log(ERROR, "start off-scrren draw!!!");
+    draw_color_use_window_surface();
     return 0;
 }
 
