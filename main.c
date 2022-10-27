@@ -942,9 +942,9 @@ static void draw_color_use_window_surface() {
     egl_gbm.pitch =
         gbm_bo_get_stride(egl_gbm.gbm_bo); // pitch = mode.hdisplay * 4
     // fake_log(ERROR, "handle = %d pitch = %d", egl_gbm.handle, egl_gbm.pitch);
-    ret = drmModeAddFB(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+    drmModeAddFB(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
                  24, 32, egl_gbm.pitch, egl_gbm.handle, &egl_gbm.fb_id);
-    ret = drmModeSetCrtc(egl_gbm.card_fd, egl_gbm.crtc->crtc_id, egl_gbm.fb_id, 0, 0,
+    drmModeSetCrtc(egl_gbm.card_fd, egl_gbm.crtc->crtc_id, egl_gbm.fb_id, 0, 0,
                    &egl_gbm.connector_id, 1, &egl_gbm.mode);
     getchar();
 }
