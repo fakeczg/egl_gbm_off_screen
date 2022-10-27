@@ -71,6 +71,7 @@ struct egl {
 
     struct {
         PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT;
+        PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC eglCreatePlatformWindowSurfaceEXT;
         PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
         PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
         PFNEGLQUERYWAYLANDBUFFERWL eglQueryWaylandBufferWL;
@@ -534,7 +535,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     EGLDisplay display =
         egl_gbm.procs.eglGetPlatformDisplayEXT(platform, remote_display, NULL);
     if (display == EGL_NO_DISPLAY) {
-        fake_log(ERROR, "Failed to create EGL display");
+        fake_log(ERROR, "Failed to create EGL Display");
         return false;
     }
     if (!egl_init_display(display)) {
@@ -542,6 +543,10 @@ static bool egl_init(EGLenum platform, void *remote_display) {
         return false;
     }
         // use surface specify config
+    const EGLint attribList[] = {
+        EGL_RENDER_BUFFER, EGL_BACK_BUFFER,
+        EGL_NONE,
+    };
     const EGLint config_attribs[] = {
         EGL_BUFFER_SIZE,     32,
         EGL_DEPTH_SIZE,      EGL_DONT_CARE,
@@ -571,6 +576,13 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     config_index = match_config_to_visual(display, GBM_FORMAT_ARGB8888, configs,
                                           num_configs);
     fake_log(INFO, "index = %d", config_index);
+	//1. egl_gbm.surface = eglCreateWindowSurface(egl_gbm.display, configs[config_index], (EGLNativeWindowType)egl_gbm.gbm_surface, attribList);
+	//2. egl_gbm.surface = eglCreatePlatformWindowSurface(egl_gbm.display, configs[config_index], egl_gbm.gbm_surface, (EGLAttrib *)attribList);
+	egl_gbm.surface = egl_gbm.procs.eglCreatePlatformWindowSurfaceEXT(egl_gbm.display, configs[config_index], egl_gbm.gbm_surface, attribList);
+    if (egl_gbm.surface == EGL_NO_SURFACE) {
+        fake_log(ERROR, "Failed to create EGL Surface");
+        return false;
+    }
 
     size_t atti = 0;
     EGLint attribs[5];
@@ -592,7 +604,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     assert(atti <= sizeof(attribs) / sizeof(attribs[0]));
 
 
-    egl_gbm.context = eglCreateContext(egl_gbm.display, EGL_NO_CONFIG_KHR,
+    egl_gbm.context = eglCreateContext(egl_gbm.display, configs[config_index],
                                        EGL_NO_CONTEXT, attribs);
     if (egl_gbm.context == EGL_NO_CONTEXT) {
         fake_log(ERROR, "Failed to create EGL context");
@@ -609,6 +621,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
             fake_log(DEBUG, "Obtained high priority context");
         }
     }
+
 
     return true;
 }
@@ -634,6 +647,9 @@ bool check_basic_egl() {
 
     load_egl_proc(&egl_gbm.procs.eglGetPlatformDisplayEXT,
                   "eglGetPlatformDisplayEXT");
+
+    load_egl_proc(&egl_gbm.procs.eglCreatePlatformWindowSurfaceEXT,
+                  "eglCreatePlatformWindowSurfaceEXT");
 
     egl_gbm.exts.KHR_platform_gbm =
         check_egl_ext(client_exts_str, "EGL_KHR_platform_gbm");
