@@ -937,6 +937,32 @@ static void draw_color_use_window_surface() {
     glClearColor(1.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     eglSwapBuffers(egl_gbm.display, egl_gbm.window_surface);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            EGL_NO_CONTEXT);
+}
+
+static void read_output_surface_to_file()
+{
+    eglMakeCurrent(egl_gbm.display, egl_gbm.window_surface,
+            egl_gbm.window_surface, egl_gbm.context);
+    static FILE *file = NULL;
+    static GLbyte *pbits = NULL;  /* CPU memory to save image */
+    static uint32_t frame_cnt = 0;
+    uint32_t frame_size = 10 * 10 * 4;
+    if (!file) {
+        file = fopen("rgba.bin", "w+");
+        assert(file);
+        pbits = (GLbyte *)malloc(frame_size);
+        assert(pbits);
+    }
+    glReadPixels(0, 0, 10, 10, GL_RGBA, GL_UNSIGNED_BYTE, pbits);
+    size_t ret = fwrite(pbits, 1, frame_size, file);
+}
+
+static void scan_output_surface_to_display()
+{
+    eglMakeCurrent(egl_gbm.display, egl_gbm.window_surface,
+                   egl_gbm.window_surface, egl_gbm.context);
     egl_gbm.gbm_bo = gbm_surface_lock_front_buffer(egl_gbm.gbm_surface);
     egl_gbm.handle = gbm_bo_get_handle(egl_gbm.gbm_bo).u32;
     egl_gbm.pitch =
@@ -971,6 +997,8 @@ int main(int argc, char **argv) {
     fake_log(ERROR, "hello world!");
     fake_log(ERROR, "start off-scrren draw!!!");
     draw_color_use_window_surface();
+    // scan_output_surface_to_display();
+    read_output_surface_to_file();
     return 0;
 }
 
