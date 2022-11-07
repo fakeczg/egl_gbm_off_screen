@@ -1036,11 +1036,11 @@ int main(int argc, char **argv) {
 
     fake_log(ERROR, "hello world!");
     fake_log(ERROR, "start off-scrren draw!!!");
-    draw_color_use_window_surface();
+    //draw_color_use_window_surface();
     //scan_output_surface_to_display();
-    read_draw_to_file(egl_gbm.window_surface, egl_gbm.window_surface, egl_gbm.context);
+    //read_draw_to_file(egl_gbm.window_surface, egl_gbm.window_surface, egl_gbm.context);
 
-    //draw_color_to_fbo_texture();
+    draw_color_to_fbo_texture();
     return 0;
 }
 
