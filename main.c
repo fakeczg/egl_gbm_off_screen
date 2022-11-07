@@ -52,6 +52,7 @@ struct egl {
 
     EGLDisplay display;
     EGLContext context;
+    EGLContext off_screen_context;
     EGLSurface window_surface;
     EGLDeviceEXT device; // may be EGL_NO_DEVICE_EXT
 
@@ -109,7 +110,9 @@ struct egl {
         bool EXT_platform_device;
     } exts;
 
-    GLuint framebuffer;
+    // FBO
+    GLuint fbo;
+    GLuint texture_target_1;
     GLuint renderbuffer;
     GLuint texture_load;
     GLuint texture_render;
@@ -145,7 +148,7 @@ struct gles_renderer {
         PFNGLPOPDEBUGGROUPKHRPROC glPopDebugGroupKHR;
         PFNGLPUSHDEBUGGROUPKHRPROC glPushDebugGroupKHR;
         PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC
-        glEGLImageTargetRenderbufferStorageOES;
+            glEGLImageTargetRenderbufferStorageOES;
     } procs;
 
     struct {
@@ -175,16 +178,16 @@ static bool device_has_name(const drmDevice *device, const char *name);
 static bool env_parse_bool(const char *option);
 static int get_egl_dmabuf_formats(struct egl *egl, int **formats);
 static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
-                                    uint64_t **modifiers,
-                                    EGLBoolean **external_only);
+        uint64_t **modifiers,
+        EGLBoolean **external_only);
 static struct drm_format **format_set_get_ref(struct drm_format_set *set,
-                                              uint32_t format);
+        uint32_t format);
 
 // egl debug
 static enum log_importance egl_log_importance(EGLint type);
 static const char *egl_error_str(EGLint error);
 static void egl_log(EGLenum error, const char *command, EGLint msg_type,
-                    EGLLabelKHR thread, EGLLabelKHR obj, const char *msg);
+        EGLLabelKHR thread, EGLLabelKHR obj, const char *msg);
 
 struct drm_format *drm_format_create(uint32_t format) {
     size_t capacity = 4;
@@ -233,7 +236,7 @@ bool drm_format_add(struct drm_format **fmt_ptr, uint64_t modifier) {
 }
 
 bool drm_format_set_add(struct drm_format_set *set, uint32_t format,
-                        uint64_t modifier) {
+        uint64_t modifier) {
     assert(format != DRM_FORMAT_INVALID);
 
     struct drm_format **ptr = format_set_get_ref(set, format);
@@ -254,7 +257,7 @@ bool drm_format_set_add(struct drm_format_set *set, uint32_t format,
         size_t new = set->capacity ? set->capacity * 2 : 4;
 
         struct drm_format **tmp = realloc(
-            set->formats, sizeof(*fmt) + sizeof(fmt->modifiers[0]) * new);
+                set->formats, sizeof(*fmt) + sizeof(fmt->modifiers[0]) * new);
         if (!tmp) {
             fake_log(ERROR, "Allocation failed");
             free(fmt);
@@ -293,25 +296,25 @@ static void init_dmabuf_formats(struct egl *egl) {
 
         // EGL始终支持隐式修饰符
         drm_format_set_add(&egl_gbm.dmabuf_texture_formats, fmt,
-                           DRM_FORMAT_MOD_INVALID);
+                DRM_FORMAT_MOD_INVALID);
         drm_format_set_add(&egl->dmabuf_render_formats, fmt,
-                           DRM_FORMAT_MOD_INVALID);
+                DRM_FORMAT_MOD_INVALID);
 
         // 如果驱动程序没有明确说明，则假设支持线性布局
         if (modifiers_len == 0) {
             // Asume the linear layout is supported if the driver doesn't
             // explicitly say otherwise
             drm_format_set_add(&egl->dmabuf_texture_formats, fmt,
-                               DRM_FORMAT_MOD_LINEAR);
+                    DRM_FORMAT_MOD_LINEAR);
             drm_format_set_add(&egl->dmabuf_render_formats, fmt,
-                               DRM_FORMAT_MOD_LINEAR);
+                    DRM_FORMAT_MOD_LINEAR);
         }
 
         for (int j = 0; j < modifiers_len; j++) {
             drm_format_set_add(&egl->dmabuf_texture_formats, fmt, modifiers[j]);
             if (!external_only[j]) {
                 drm_format_set_add(&egl->dmabuf_render_formats, fmt,
-                                   modifiers[j]);
+                        modifiers[j]);
             }
         }
 
@@ -325,11 +328,11 @@ static void init_dmabuf_formats(struct egl *egl) {
     }
     for (int i = 0; i < formats_len; i++) {
         snprintf(&str_formats[i * 5], (formats_len - i) * 5 + 1, "%.4s ",
-                 (char *)&formats[i]);
+                (char *)&formats[i]);
     }
     fake_log(INFO, "Supported DMA-BUF formats: %s", str_formats);
     fake_log(INFO, "EGL DMA-BUF format modifiers %s",
-             has_modifiers ? "supported" : "unsupported");
+            has_modifiers ? "supported" : "unsupported");
     free(str_formats);
 
     egl->has_modifiers = has_modifiers;
@@ -350,9 +353,9 @@ static int open_render_node(int drm_fd) {
             return -1;
         }
         fake_log(DEBUG,
-                 "DRM device '%s' has no render node, "
-                 "falling back to primary node",
-                 render_name);
+                "DRM device '%s' has no render node, "
+                "falling back to primary node",
+                render_name);
     }
 
     int render_fd = open(render_name, O_RDWR | O_CLOEXEC);
@@ -399,9 +402,9 @@ EGLDeviceEXT get_egl_device_from_fd(int fd) {
     EGLDeviceEXT egl_device = NULL;
     for (int i = 0; i < nb_devices; i++) {
         const char *egl_device_name = egl_gbm.procs.eglQueryDeviceStringEXT(
-            devices[i], EGL_DRM_DEVICE_FILE_EXT);
+                devices[i], EGL_DRM_DEVICE_FILE_EXT);
         /* const char *egl_device_name = egl_gbm.procs.eglQueryDeviceStringEXT(
-         */
+        */
         /* 		devices[i], EGL_DRM_RENDER_NODE_FILE_EXT); */
         if (egl_device_name == NULL) {
             continue;
@@ -443,26 +446,26 @@ static bool egl_init_display(EGLDisplay display) {
     egl_gbm.exts.EXT_image_dma_buf_import =
         check_egl_ext(display_exts_str, "EGL_EXT_image_dma_buf_import");
     if (check_egl_ext(display_exts_str,
-                      "EGL_EXT_image_dma_buf_import_modifiers")) {
+                "EGL_EXT_image_dma_buf_import_modifiers")) {
         egl_gbm.exts.EXT_image_dma_buf_import_modifiers = true;
         load_egl_proc(&egl_gbm.procs.eglQueryDmaBufFormatsEXT,
-                      "eglQueryDmaBufFormatsEXT");
+                "eglQueryDmaBufFormatsEXT");
         load_egl_proc(&egl_gbm.procs.eglQueryDmaBufModifiersEXT,
-                      "eglQueryDmaBufModifiersEXT");
+                "eglQueryDmaBufModifiersEXT");
     }
 
     const char *device_exts_str = NULL, *driver_name = NULL;
     if (egl_gbm.exts.EXT_device_query) {
         EGLAttrib device_attrib;
         if (!egl_gbm.procs.eglQueryDisplayAttribEXT(
-                egl_gbm.display, EGL_DEVICE_EXT, &device_attrib)) {
+                    egl_gbm.display, EGL_DEVICE_EXT, &device_attrib)) {
             fake_log(ERROR, "eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
             return false;
         }
         egl_gbm.device = (EGLDeviceEXT)device_attrib;
 
         device_exts_str = egl_gbm.procs.eglQueryDeviceStringEXT(egl_gbm.device,
-                                                                EGL_EXTENSIONS);
+                EGL_EXTENSIONS);
         if (device_exts_str == NULL) {
             fake_log(ERROR, "eglQueryDeviceStringEXT(EGL_EXTENSIONS) failed");
             return false;
@@ -473,9 +476,9 @@ static bool egl_init_display(EGLDisplay display) {
                 fake_log(INFO, "Using software rendering");
             } else {
                 fake_log(ERROR,
-                         "Software rendering detected, please use "
-                         "the WLR_RENDERER_ALLOW_SOFTWARE environment variable "
-                         "to proceed");
+                        "Software rendering detected, please use "
+                        "the WLR_RENDERER_ALLOW_SOFTWARE environment variable "
+                        "to proceed");
                 return false;
             }
         }
@@ -483,7 +486,7 @@ static bool egl_init_display(EGLDisplay display) {
 #ifdef EGL_DRIVER_NAME_EXT
         if (check_egl_ext(device_exts_str, "EGL_EXT_device_persistent_id")) {
             driver_name = egl_gbm.procs.eglQueryDeviceStringEXT(
-                egl_gbm.device, EGL_DRIVER_NAME_EXT);
+                    egl_gbm.device, EGL_DRIVER_NAME_EXT);
         }
 #endif
         egl_gbm.exts.EXT_device_drm =
@@ -493,9 +496,9 @@ static bool egl_init_display(EGLDisplay display) {
     }
 
     if (!check_egl_ext(display_exts_str, "EGL_KHR_no_config_context") &&
-        !check_egl_ext(display_exts_str, "EGL_MESA_configless_context")) {
+            !check_egl_ext(display_exts_str, "EGL_MESA_configless_context")) {
         fake_log(ERROR, "EGL_KHR_no_config_context or "
-                        "EGL_MESA_configless_context not supported");
+                "EGL_MESA_configless_context not supported");
         return false;
     }
 
@@ -513,7 +516,7 @@ static bool egl_init_display(EGLDisplay display) {
         fake_log(INFO, "Supported EGL device extensions: %s", device_exts_str);
     }
     fake_log(INFO, "EGL vendor: %s",
-             eglQueryString(egl_gbm.display, EGL_VENDOR));
+            eglQueryString(egl_gbm.display, EGL_VENDOR));
     if (driver_name != NULL) {
         fake_log(INFO, "EGL driver name: %s", driver_name);
     }
@@ -524,12 +527,12 @@ static bool egl_init_display(EGLDisplay display) {
 }
 
 static int match_config_to_visual(EGLDisplay egl_display, EGLint visual_id,
-                                  EGLConfig *configs, int count) {
+        EGLConfig *configs, int count) {
 
     EGLint id;
     for (int i = 0; i < count; ++i) {
         if (!eglGetConfigAttrib(egl_display, configs[i], EGL_NATIVE_VISUAL_ID,
-                                &id))
+                    &id))
             continue;
         if (id == visual_id)
             return i;
@@ -573,14 +576,14 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     fake_log(INFO, "Display config max num = %d", max_num_configs);
     EGLConfig *configs = malloc(num_configs * sizeof(EGLConfig));
     if (!eglChooseConfig(display, config_attribs, configs, max_num_configs,
-                         &num_configs)) {
+                &num_configs)) {
         fake_log(ERROR, "Failed to choose specify configs");
         return false;
     }
     fake_log(INFO, "匹配 config_attribs Display choose config num = %d",
-             num_configs);
+            num_configs);
     config_index = match_config_to_visual(display, GBM_FORMAT_ARGB8888, configs,
-                                          num_configs);
+            num_configs);
     fake_log(INFO, "index = %d", config_index);
     // 1. egl_gbm.window_surface = eglCreateWindowSurface(egl_gbm.display,
     // configs[config_index], (EGLNativeWindowType)egl_gbm.gbm_surface,
@@ -589,8 +592,8 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     // eglCreatePlatformWindowSurface(egl_gbm.display, configs[config_index],
     // egl_gbm.gbm_surface, (EGLAttrib *)attribList);
     egl_gbm.window_surface = egl_gbm.procs.eglCreatePlatformWindowSurfaceEXT(
-        egl_gbm.display, configs[config_index], egl_gbm.gbm_surface,
-        attribList);
+            egl_gbm.display, configs[config_index], egl_gbm.gbm_surface,
+            attribList);
     if (egl_gbm.window_surface == EGL_NO_SURFACE) {
         fake_log(ERROR, "Failed to create EGL Surface");
         return false;
@@ -616,7 +619,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     assert(atti <= sizeof(attribs) / sizeof(attribs[0]));
 
     egl_gbm.context = eglCreateContext(egl_gbm.display, configs[config_index],
-                                       EGL_NO_CONTEXT, attribs);
+            EGL_NO_CONTEXT, attribs);
     if (egl_gbm.context == EGL_NO_CONTEXT) {
         fake_log(ERROR, "Failed to create EGL context");
         return false;
@@ -625,7 +628,7 @@ static bool egl_init(EGLenum platform, void *remote_display) {
     if (request_high_priority) {
         EGLint priority = EGL_CONTEXT_PRIORITY_MEDIUM_IMG;
         eglQueryContext(egl_gbm.display, egl_gbm.context,
-                        EGL_CONTEXT_PRIORITY_LEVEL_IMG, &priority);
+                EGL_CONTEXT_PRIORITY_LEVEL_IMG, &priority);
         if (priority != EGL_CONTEXT_PRIORITY_HIGH_IMG) {
             fake_log(INFO, "Failed to obtain a high priority context");
         } else {
@@ -656,10 +659,10 @@ bool check_basic_egl() {
     }
 
     load_egl_proc(&egl_gbm.procs.eglGetPlatformDisplayEXT,
-                  "eglGetPlatformDisplayEXT");
+            "eglGetPlatformDisplayEXT");
 
     load_egl_proc(&egl_gbm.procs.eglCreatePlatformWindowSurfaceEXT,
-                  "eglCreatePlatformWindowSurfaceEXT");
+            "eglCreatePlatformWindowSurfaceEXT");
 
     egl_gbm.exts.KHR_platform_gbm =
         check_egl_ext(client_exts_str, "EGL_KHR_platform_gbm");
@@ -668,22 +671,22 @@ bool check_basic_egl() {
         check_egl_ext(client_exts_str, "EGL_EXT_platform_device");
 
     if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
-        check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
+            check_egl_ext(client_exts_str, "EGL_EXT_device_enumeration")) {
         load_egl_proc(&egl_gbm.procs.eglQueryDevicesEXT, "eglQueryDevicesEXT");
     }
 
     if (check_egl_ext(client_exts_str, "EGL_EXT_device_base") ||
-        check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
+            check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
         egl_gbm.exts.EXT_device_query = true;
         load_egl_proc(&egl_gbm.procs.eglQueryDeviceStringEXT,
-                      "eglQueryDeviceStringEXT");
+                "eglQueryDeviceStringEXT");
         load_egl_proc(&egl_gbm.procs.eglQueryDisplayAttribEXT,
-                      "eglQueryDisplayAttribEXT");
+                "eglQueryDisplayAttribEXT");
     }
 
     if (check_egl_ext(client_exts_str, "EGL_KHR_debug")) {
         load_egl_proc(&egl_gbm.procs.eglDebugMessageControlKHR,
-                      "eglDebugMessageControlKHR");
+                "eglDebugMessageControlKHR");
 
         static const EGLAttrib debug_attribs[] = {
             EGL_DEBUG_MSG_CRITICAL_KHR,
@@ -735,7 +738,7 @@ bool init_egl() {
     }
 
     if (egl_gbm.exts.KHR_platform_gbm) {
-		// we use egl swapbuffer to set crtc muse card fd
+        // we use egl swapbuffer to set crtc muse card fd
         int gbm_fd = egl_gbm.card_fd;//open_render_node(egl_gbm.card_fd);
         if (gbm_fd < 0) {
             fake_log(ERROR, "Failed to open DRM render node");
@@ -751,8 +754,8 @@ bool init_egl() {
 
         // use gbm surface to gen window surface
         egl_gbm.gbm_surface = gbm_surface_create(
-            egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
-            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT |  GBM_BO_USE_RENDERING);
+                egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+                GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT |  GBM_BO_USE_RENDERING);
         if (!egl_gbm.gbm_surface) {
             gbm_device_destroy(egl_gbm.gbm_device);
             close(gbm_fd);
@@ -779,7 +782,7 @@ error:
     fake_log(ERROR, "Failed to initialize EGL context");
     if (egl_gbm.display) {
         eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                       EGL_NO_CONTEXT);
+                EGL_NO_CONTEXT);
         eglTerminate(egl_gbm.display);
     }
     eglReleaseThread();
@@ -799,8 +802,8 @@ bool init_gbm(const char *path) {
     // https://cgit.freedesktop.org/mesa/mesa/commit/src/egl/main?id=468cc866b4b308cee40470f06b31002c6c56da96
     // use surface to manage buffer
     egl_gbm.gbm_surface = gbm_surface_create(
-        egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
-        GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+            egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     assert(NULL != egl_gbm.gbm_surface);
 
     return true;
@@ -820,7 +823,7 @@ static drmModeConnector *find_connector(int fd, drmModeRes *resources) {
 }
 
 static drmModeEncoder *find_encoder(int fd, drmModeRes *resources,
-                                    drmModeConnector *connector) {
+        drmModeConnector *connector) {
 
     if (connector->encoder_id) {
         return drmModeGetEncoder(fd, connector->encoder_id);
@@ -903,21 +906,21 @@ bool init_opengles(struct egl *egl) {
     if (check_gl_ext(exts_str, "GL_KHR_debug")) {
         gles_fake.exts.KHR_debug = true;
         load_gl_proc(&gles_fake.procs.glDebugMessageCallbackKHR,
-                     "glDebugMessageCallbackKHR");
+                "glDebugMessageCallbackKHR");
         load_gl_proc(&gles_fake.procs.glDebugMessageControlKHR,
-                     "glDebugMessageControlKHR");
+                "glDebugMessageControlKHR");
     }
 
     if (check_gl_ext(exts_str, "GL_OES_EGL_image_external")) {
         gles_fake.exts.OES_egl_image_external = true;
         load_gl_proc(&gles_fake.procs.glEGLImageTargetTexture2DOES,
-                     "glEGLImageTargetTexture2DOES");
+                "glEGLImageTargetTexture2DOES");
     }
 
     if (check_gl_ext(exts_str, "GL_OES_EGL_image")) {
         gles_fake.exts.OES_egl_image = true;
         load_gl_proc(&gles_fake.procs.glEGLImageTargetRenderbufferStorageOES,
-                     "glEGLImageTargetRenderbufferStorageOES");
+                "glEGLImageTargetRenderbufferStorageOES");
     }
 
     fake_log(INFO, "Using %s", glGetString(GL_VERSION));
@@ -933,7 +936,7 @@ error:
 
 static void draw_color_use_window_surface() {
     eglMakeCurrent(egl_gbm.display, egl_gbm.window_surface,
-                   egl_gbm.window_surface, egl_gbm.context);
+            egl_gbm.window_surface, egl_gbm.context);
     glClearColor(1.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     eglSwapBuffers(egl_gbm.display, egl_gbm.window_surface);
@@ -941,10 +944,9 @@ static void draw_color_use_window_surface() {
             EGL_NO_CONTEXT);
 }
 
-static void read_output_surface_to_file()
+static void read_draw_to_file(EGLSurface draw, EGLSurface read, EGLContext context)
 {
-    eglMakeCurrent(egl_gbm.display, egl_gbm.window_surface,
-            egl_gbm.window_surface, egl_gbm.context);
+    eglMakeCurrent(egl_gbm.display, draw, read , context);
     static FILE *file = NULL;
     static GLbyte *pbits = NULL;  /* CPU memory to save image */
     static uint32_t frame_cnt = 0;
@@ -962,19 +964,57 @@ static void read_output_surface_to_file()
 static void scan_output_surface_to_display()
 {
     eglMakeCurrent(egl_gbm.display, egl_gbm.window_surface,
-                   egl_gbm.window_surface, egl_gbm.context);
+            egl_gbm.window_surface, egl_gbm.context);
     egl_gbm.gbm_bo = gbm_surface_lock_front_buffer(egl_gbm.gbm_surface);
     egl_gbm.handle = gbm_bo_get_handle(egl_gbm.gbm_bo).u32;
     egl_gbm.pitch =
         gbm_bo_get_stride(egl_gbm.gbm_bo); // pitch = mode.hdisplay * 4
     // fake_log(ERROR, "handle = %d pitch = %d", egl_gbm.handle, egl_gbm.pitch);
     drmModeAddFB(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
-                 24, 32, egl_gbm.pitch, egl_gbm.handle, &egl_gbm.fb_id);
+            24, 32, egl_gbm.pitch, egl_gbm.handle, &egl_gbm.fb_id);
     drmModeSetCrtc(egl_gbm.card_fd, egl_gbm.crtc->crtc_id, egl_gbm.fb_id, 0, 0,
-                   &egl_gbm.connector_id, 1, &egl_gbm.mode);
+            &egl_gbm.connector_id, 1, &egl_gbm.mode);
     getchar();
 }
 
+static void draw_color_to_fbo_texture(){
+
+    // Texture
+    //off_screen_context
+    static const EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    egl_gbm.off_screen_context = eglCreateContext(egl_gbm.display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, context_attribs);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            egl_gbm.off_screen_context);
+
+    glGenTextures(1, &egl_gbm.texture_target_1);
+    glBindTexture(GL_TEXTURE_2D, egl_gbm.texture_target_1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    // Fbo
+    glGenFramebuffers(1, &egl_gbm.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, egl_gbm.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, egl_gbm.texture_target_1, 0);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "FBO creation failed\n");
+    }
+
+
+    glClearColor(0.0f, 1.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFlush();
+    read_draw_to_file(EGL_NO_SURFACE, EGL_NO_SURFACE, egl_gbm.off_screen_context);
+
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            EGL_NO_CONTEXT);
+
+}
 int main(int argc, char **argv) {
 
     log_init(DEBUG, NULL);
@@ -988,23 +1028,25 @@ int main(int argc, char **argv) {
 
     if (!init_egl())
         fake_log(ERROR, "The current device egl cannot meet the operating "
-                        "conditions of wlroots!!!");
+                "conditions of wlroots!!!");
 
     if (!init_opengles(&egl_gbm))
         fake_log(ERROR, "The current device opengles cannot meet the operating "
-                        "conditions of wlroots!!!");
+                "conditions of wlroots!!!");
 
     fake_log(ERROR, "hello world!");
     fake_log(ERROR, "start off-scrren draw!!!");
     draw_color_use_window_surface();
-    // scan_output_surface_to_display();
-    read_output_surface_to_file();
+    //scan_output_surface_to_display();
+    read_draw_to_file(egl_gbm.window_surface, egl_gbm.window_surface, egl_gbm.context);
+
+    //draw_color_to_fbo_texture();
     return 0;
 }
 
 bool egl_make_current(struct egl *egl) {
     if (!eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                        egl->context)) {
+                egl->context)) {
         fake_log(ERROR, "eglMakeCurrent failed");
         return false;
     }
@@ -1079,61 +1121,61 @@ static bool device_has_name(const drmDevice *device, const char *name) {
 
 static enum log_importance egl_log_importance(EGLint type) {
     switch (type) {
-    case EGL_DEBUG_MSG_CRITICAL_KHR:
-        return ERROR;
-    case EGL_DEBUG_MSG_ERROR_KHR:
-        return ERROR;
-    case EGL_DEBUG_MSG_WARN_KHR:
-        return ERROR;
-    case EGL_DEBUG_MSG_INFO_KHR:
-        return INFO;
-    default:
-        return INFO;
+        case EGL_DEBUG_MSG_CRITICAL_KHR:
+            return ERROR;
+        case EGL_DEBUG_MSG_ERROR_KHR:
+            return ERROR;
+        case EGL_DEBUG_MSG_WARN_KHR:
+            return ERROR;
+        case EGL_DEBUG_MSG_INFO_KHR:
+            return INFO;
+        default:
+            return INFO;
     }
 }
 static const char *egl_error_str(EGLint error) {
     switch (error) {
-    case EGL_SUCCESS:
-        return "EGL_SUCCESS";
-    case EGL_NOT_INITIALIZED:
-        return "EGL_NOT_INITIALIZED";
-    case EGL_BAD_ACCESS:
-        return "EGL_BAD_ACCESS";
-    case EGL_BAD_ALLOC:
-        return "EGL_BAD_ALLOC";
-    case EGL_BAD_ATTRIBUTE:
-        return "EGL_BAD_ATTRIBUTE";
-    case EGL_BAD_CONTEXT:
-        return "EGL_BAD_CONTEXT";
-    case EGL_BAD_CONFIG:
-        return "EGL_BAD_CONFIG";
-    case EGL_BAD_CURRENT_SURFACE:
-        return "EGL_BAD_CURRENT_SURFACE";
-    case EGL_BAD_DISPLAY:
-        return "EGL_BAD_DISPLAY";
-    case EGL_BAD_DEVICE_EXT:
-        return "EGL_BAD_DEVICE_EXT";
-    case EGL_BAD_SURFACE:
-        return "EGL_BAD_SURFACE";
-    case EGL_BAD_MATCH:
-        return "EGL_BAD_MATCH";
-    case EGL_BAD_PARAMETER:
-        return "EGL_BAD_PARAMETER";
-    case EGL_BAD_NATIVE_PIXMAP:
-        return "EGL_BAD_NATIVE_PIXMAP";
-    case EGL_BAD_NATIVE_WINDOW:
-        return "EGL_BAD_NATIVE_WINDOW";
-    case EGL_CONTEXT_LOST:
-        return "EGL_CONTEXT_LOST";
+        case EGL_SUCCESS:
+            return "EGL_SUCCESS";
+        case EGL_NOT_INITIALIZED:
+            return "EGL_NOT_INITIALIZED";
+        case EGL_BAD_ACCESS:
+            return "EGL_BAD_ACCESS";
+        case EGL_BAD_ALLOC:
+            return "EGL_BAD_ALLOC";
+        case EGL_BAD_ATTRIBUTE:
+            return "EGL_BAD_ATTRIBUTE";
+        case EGL_BAD_CONTEXT:
+            return "EGL_BAD_CONTEXT";
+        case EGL_BAD_CONFIG:
+            return "EGL_BAD_CONFIG";
+        case EGL_BAD_CURRENT_SURFACE:
+            return "EGL_BAD_CURRENT_SURFACE";
+        case EGL_BAD_DISPLAY:
+            return "EGL_BAD_DISPLAY";
+        case EGL_BAD_DEVICE_EXT:
+            return "EGL_BAD_DEVICE_EXT";
+        case EGL_BAD_SURFACE:
+            return "EGL_BAD_SURFACE";
+        case EGL_BAD_MATCH:
+            return "EGL_BAD_MATCH";
+        case EGL_BAD_PARAMETER:
+            return "EGL_BAD_PARAMETER";
+        case EGL_BAD_NATIVE_PIXMAP:
+            return "EGL_BAD_NATIVE_PIXMAP";
+        case EGL_BAD_NATIVE_WINDOW:
+            return "EGL_BAD_NATIVE_WINDOW";
+        case EGL_CONTEXT_LOST:
+            return "EGL_CONTEXT_LOST";
     }
     return "unknown error";
 }
 
 static void egl_log(EGLenum error, const char *command, EGLint msg_type,
-                    EGLLabelKHR thread, EGLLabelKHR obj, const char *msg) {
+        EGLLabelKHR thread, EGLLabelKHR obj, const char *msg) {
     _debug_log(egl_log_importance(msg_type),
-               "[EGL] command: %s, error: %s (0x%x), message: \"%s\"", command,
-               egl_error_str(error), error, msg);
+            "[EGL] command: %s, error: %s (0x%x), message: \"%s\"", command,
+            egl_error_str(error), error, msg);
 }
 
 static bool env_parse_bool(const char *option) {
@@ -1192,7 +1234,7 @@ static int get_egl_dmabuf_formats(struct egl *egl, int **formats) {
     }
 
     if (!egl->procs.eglQueryDmaBufFormatsEXT(egl->display, num, *formats,
-                                             &num)) {
+                &num)) {
         fake_log(ERROR, "Failed to query dmabuf format");
         free(*formats);
         return -1;
@@ -1201,8 +1243,8 @@ static int get_egl_dmabuf_formats(struct egl *egl, int **formats) {
 }
 
 static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
-                                    uint64_t **modifiers,
-                                    EGLBoolean **external_only) {
+        uint64_t **modifiers,
+        EGLBoolean **external_only) {
     *modifiers = NULL;
     *external_only = NULL;
 
@@ -1216,7 +1258,7 @@ static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
 
     EGLint num;
     if (!egl->procs.eglQueryDmaBufModifiersEXT(egl->display, format, 0, NULL,
-                                               NULL, &num)) {
+                NULL, &num)) {
         fake_log(ERROR, "Failed to query dmabuf number of modifiers");
         return -1;
     }
@@ -1238,7 +1280,7 @@ static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
     }
 
     if (!egl->procs.eglQueryDmaBufModifiersEXT(
-            egl->display, format, num, *modifiers, *external_only, &num)) {
+                egl->display, format, num, *modifiers, *external_only, &num)) {
         fake_log(ERROR, "Failed to query dmabuf modifiers");
         free(*modifiers);
         free(*external_only);
@@ -1248,7 +1290,7 @@ static int get_egl_dmabuf_modifiers(struct egl *egl, int format,
 }
 
 static struct drm_format **format_set_get_ref(struct drm_format_set *set,
-                                              uint32_t format) {
+        uint32_t format) {
     for (size_t i = 0; i < set->len; ++i) {
         if (set->formats[i]->format == format) {
             return &set->formats[i];
