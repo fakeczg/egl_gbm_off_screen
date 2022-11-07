@@ -46,6 +46,7 @@ struct gles2_tex_shader {
     GLint tex_attrib;
 };
 
+#define MAX_BUFFER_PLANES 4
 struct egl {
     int card_fd;
     int render_fd;
@@ -59,6 +60,14 @@ struct egl {
     struct gbm_device *gbm_device;
     struct gbm_surface *gbm_surface;
     struct gbm_bo *gbm_bo;
+    struct gbm_bo *gbm_rbo;
+    EGLImageKHR egl_image;
+    int plane_count;
+    int dmabuf_fds[MAX_BUFFER_PLANES];
+    uint32_t strides[MAX_BUFFER_PLANES];
+    uint32_t offsets[MAX_BUFFER_PLANES];
+
+
     unsigned int handle;
     unsigned int pitch;
     unsigned int fb_id;
@@ -1015,6 +1024,86 @@ static void draw_color_to_fbo_texture(){
             EGL_NO_CONTEXT);
 
 }
+
+static void draw_color_to_fbo_renderbuffer_display(){
+
+    // dmabuf: create gbm_bo
+    egl_gbm.gbm_rbo = gbm_bo_create(
+            egl_gbm.gbm_device, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+            GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    assert(NULL != egl_gbm.gbm_rbo);
+    // RGB plane count = 1
+    // YUY may be plane count = 3
+    egl_gbm.plane_count = gbm_bo_get_plane_count(egl_gbm.gbm_rbo);
+    egl_gbm.strides[0] = gbm_bo_get_stride(egl_gbm.gbm_rbo);
+	egl_gbm.dmabuf_fds[0] = gbm_bo_get_fd(egl_gbm.gbm_rbo);
+    egl_gbm.offsets[0] = gbm_bo_get_offset(egl_gbm.gbm_rbo,0);
+    fake_log(ERROR, "plane_count = %d offset = %d strides = %d dmabuf_fds = %d", egl_gbm.plane_count, egl_gbm.offsets[0], egl_gbm.strides[0], egl_gbm.dmabuf_fds[0]);
+
+
+   // egl_image create
+    const EGLint attribs_test[] = {
+        EGL_WIDTH, egl_gbm.mode.hdisplay,
+        EGL_HEIGHT, egl_gbm.mode.vdisplay,
+        EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_ARGB8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT, egl_gbm.dmabuf_fds[0],
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, egl_gbm.strides[0],
+        EGL_NONE,
+    };
+
+    // EGL_KHR_image_base + EGL_EXT_image_dma_buf_import
+    egl_gbm.egl_image = egl_gbm.procs.eglCreateImageKHR(egl_gbm.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs_test);
+    assert(EGL_NO_IMAGE_KHR != egl_gbm.egl_image);
+
+    // Render Buffer
+    //off_screen_context
+    static const EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    egl_gbm.off_screen_context = eglCreateContext(egl_gbm.display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, context_attribs);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            egl_gbm.off_screen_context);
+
+	glGenRenderbuffers(1, &egl_gbm.renderbuffer);
+	glBindRenderbuffer(GL_RENDERBUFFER, egl_gbm.renderbuffer);
+    // GL_OES_EGL_image
+    gles_fake.procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, egl_gbm.egl_image);
+
+    // Fbo
+    glGenFramebuffers(1, &egl_gbm.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, egl_gbm.fbo);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_RENDERBUFFER, egl_gbm.renderbuffer);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "FBO creation failed\n");
+    }
+
+
+    glClearColor(0.0f, 0.0f, 1.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFlush();
+    read_draw_to_file(EGL_NO_SURFACE, EGL_NO_SURFACE, egl_gbm.off_screen_context);
+    egl_gbm.handle = gbm_bo_get_handle(egl_gbm.gbm_rbo).u32;
+    egl_gbm.pitch =
+        gbm_bo_get_stride(egl_gbm.gbm_rbo); // pitch = mode.hdisplay * 4
+    fake_log(ERROR, "handle = %d pitch = %d", egl_gbm.handle, egl_gbm.pitch);
+    drmModeAddFB(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+            24, 32, egl_gbm.pitch, egl_gbm.handle, &egl_gbm.fb_id);
+    drmModeSetCrtc(egl_gbm.card_fd, egl_gbm.crtc->crtc_id, egl_gbm.fb_id, 0, 0,
+            &egl_gbm.connector_id, 1, &egl_gbm.mode);
+    getchar();
+
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    eglDestroyImage(egl_gbm.display, egl_gbm.egl_image);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            EGL_NO_CONTEXT);
+
+}
+
 int main(int argc, char **argv) {
 
     log_init(DEBUG, NULL);
@@ -1040,7 +1129,8 @@ int main(int argc, char **argv) {
     //scan_output_surface_to_display();
     //read_draw_to_file(egl_gbm.window_surface, egl_gbm.window_surface, egl_gbm.context);
 
-    draw_color_to_fbo_texture();
+    //draw_color_to_fbo_texture();
+    draw_color_to_fbo_renderbuffer_display();
     return 0;
 }
 
@@ -1299,3 +1389,4 @@ static struct drm_format **format_set_get_ref(struct drm_format_set *set,
 
     return NULL;
 }
+
