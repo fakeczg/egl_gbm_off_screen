@@ -174,6 +174,19 @@ struct gles_renderer {
     uint32_t viewport_width, viewport_height;
 };
 
+struct dmabuf_dumb_buffer {
+	uint32_t handle;
+	uint32_t stride;
+	uint64_t size;
+	int prime_fd;
+    uint32_t fb_id;
+};
+
+enum egl_image_target {
+    texture,
+    renderbuffer,
+};
+
 // struct
 struct egl egl_gbm;
 struct gles_renderer gles_fake;
@@ -1103,6 +1116,88 @@ static void draw_color_to_fbo_renderbuffer_display(){
             EGL_NO_CONTEXT);
 
 }
+static void draw_color_to_fbo_dumb_buffer_display(enum egl_image_target target ) {
+
+    // dmabuf: use dumb buffer
+    struct dmabuf_dumb_buffer dumb_buffer_dmabuf = {0};
+    drmModeCreateDumbBuffer(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay, 32,
+            0 , &dumb_buffer_dmabuf.handle, &dumb_buffer_dmabuf.stride,
+            &dumb_buffer_dmabuf.size);
+    // get prime_fd by dma-buf
+    drmPrimeHandleToFD(egl_gbm.card_fd, dumb_buffer_dmabuf.handle, DRM_CLOEXEC, &dumb_buffer_dmabuf.prime_fd);
+
+
+   // egl_image create
+    const EGLint attribs_test[] = {
+        EGL_WIDTH, egl_gbm.mode.hdisplay,
+        EGL_HEIGHT, egl_gbm.mode.vdisplay,
+        EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_ARGB8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT, dumb_buffer_dmabuf.prime_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, dumb_buffer_dmabuf.stride,
+        EGL_NONE,
+    };
+
+    // EGL_KHR_image_base + EGL_EXT_image_dma_buf_import
+    egl_gbm.egl_image = egl_gbm.procs.eglCreateImageKHR(egl_gbm.display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs_test);
+    assert(EGL_NO_IMAGE_KHR != egl_gbm.egl_image);
+
+    // Texture or Render Buffer
+    // off_screen_context
+    static const EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    egl_gbm.off_screen_context = eglCreateContext(egl_gbm.display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, context_attribs);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            egl_gbm.off_screen_context);
+
+    // Fbo
+    glGenFramebuffers(1, &egl_gbm.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, egl_gbm.fbo);
+
+    if (target == texture)
+    {
+        glGenTextures(1, &egl_gbm.texture_render);
+        glBindTexture(GL_TEXTURE_2D, egl_gbm.texture_render);
+        // GL_OES_EGL_image
+        gles_fake.procs.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, egl_gbm.egl_image);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, egl_gbm.texture_render, 0);
+    } else if (target == renderbuffer) {
+        glGenRenderbuffers(1, &egl_gbm.renderbuffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, egl_gbm.renderbuffer);
+        // GL_OES_EGL_image
+        gles_fake.procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, egl_gbm.egl_image);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_RENDERBUFFER, egl_gbm.renderbuffer);
+    }
+
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "FBO creation failed\n");
+    }
+
+
+    glClearColor(0.0f, 0.0f, 1.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFlush();
+    read_draw_to_file(EGL_NO_SURFACE, EGL_NO_SURFACE, egl_gbm.off_screen_context);
+    fake_log(ERROR, "handle = %d pitch = %d", dumb_buffer_dmabuf.handle, dumb_buffer_dmabuf.stride);
+    drmModeAddFB(egl_gbm.card_fd, egl_gbm.mode.hdisplay, egl_gbm.mode.vdisplay,
+            24, 32, dumb_buffer_dmabuf.stride, dumb_buffer_dmabuf.handle, &dumb_buffer_dmabuf.fb_id);
+    drmModeSetCrtc(egl_gbm.card_fd, egl_gbm.crtc->crtc_id, dumb_buffer_dmabuf.fb_id, 0, 0,
+            &egl_gbm.connector_id, 1, &egl_gbm.mode);
+    getchar();
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    eglDestroyImage(egl_gbm.display, egl_gbm.egl_image);
+    eglMakeCurrent(egl_gbm.display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+            EGL_NO_CONTEXT);
+
+}
+
 
 int main(int argc, char **argv) {
 
@@ -1130,7 +1225,9 @@ int main(int argc, char **argv) {
     //read_draw_to_file(egl_gbm.window_surface, egl_gbm.window_surface, egl_gbm.context);
 
     //draw_color_to_fbo_texture();
-    draw_color_to_fbo_renderbuffer_display();
+    //draw_color_to_fbo_renderbuffer_display();
+
+    draw_color_to_fbo_dumb_buffer_display(texture);
     return 0;
 }
 
